@@ -81,7 +81,6 @@ function showScreen(loggedIn) {
 
 async function refreshConfig() {
   const cfg = await invoke("get_config");
-  el("base-url").value = cfg.base_url ?? "";
   el("device-name-input").value = cfg.device_name ?? "";
   el("auto-sync-toggle").checked = cfg.auto_sync_enabled;
   extraFolders = cfg.extra_folders ?? {};
@@ -244,16 +243,6 @@ document.addEventListener("keydown", (e) => {
 el("device-name-input").addEventListener("change", async (e) => {
   try {
     await invoke("save_device_name", { deviceName: e.target.value });
-  } catch (err) {
-    setStatus(el("config-status"), String(err), "err");
-  }
-});
-
-el("base-url").addEventListener("change", async (e) => {
-  try {
-    await invoke("save_base_url", { baseUrl: e.target.value });
-    await refreshConfig();
-    setStatus(el("config-status"), "URL salva.", "ok");
   } catch (err) {
     setStatus(el("config-status"), String(err), "err");
   }

@@ -14,16 +14,16 @@ use std::path::Path;
 pub const SUPABASE_URL: &str = "https://olgziujndtlvxegcnaoq.supabase.co";
 pub const SUPABASE_ANON_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9sZ3ppdWpuZHRsdnhlZ2NuYW9xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUxNjExMDYsImV4cCI6MjEwMDczNzEwNn0.NspOVPJcZ_pjodnDTHzalDIcjVkqoR6YVfwiN4MpBbY";
 
-/// Domínio de produção do PokerSync — o jogador nunca precisa digitar
-/// isso. Só existe um campo de URL na UI dentro de "Configurações
-/// avançadas", pra depuração (staging, self-host); o fluxo normal nem
-/// mostra essa tela.
+/// Domínio de produção do PokerSync — fixo, sem campo editável em lugar
+/// nenhum da UI (não existe mais "outro site" pra digitar; era pensado
+/// só pra depuração interna e nunca deveria ter ficado exposto pro
+/// jogador). Todo lugar que precisa da URL do produto (login com
+/// Google, troca do código de login, sincronização, teste de conexão)
+/// usa esta constante direto.
 pub const DEFAULT_BASE_URL: &str = "https://www.pokersync.com.br";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    #[serde(default = "default_base_url")]
-    pub base_url: String,
     #[serde(default)]
     pub user_email: Option<String>,
     /// Identifica esta instalação em hand_sync_devices.device_id — gerado
@@ -53,10 +53,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_base_url() -> String {
-    DEFAULT_BASE_URL.to_string()
-}
-
 fn new_device_id() -> String {
     format!("agent-{}", uuid::Uuid::new_v4())
 }
@@ -74,7 +70,6 @@ fn hostname() -> String {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            base_url: default_base_url(),
             user_email: None,
             device_id: new_device_id(),
             device_name: default_device_name(),

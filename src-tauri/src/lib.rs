@@ -34,7 +34,6 @@ struct AppState {
 
 #[derive(serde::Serialize)]
 struct ConfigDto {
-    base_url: String,
     logged_in: bool,
     user_email: Option<String>,
     device_name: String,
@@ -44,7 +43,6 @@ struct ConfigDto {
 
 fn config_dto(c: &AppConfig) -> ConfigDto {
     ConfigDto {
-        base_url: c.base_url.clone(),
         logged_in: keychain::load().is_some(),
         user_email: c.user_email.clone(),
         device_name: c.device_name.clone(),
@@ -56,29 +54,6 @@ fn config_dto(c: &AppConfig) -> ConfigDto {
 #[tauri::command]
 fn get_config(state: State<AppState>) -> ConfigDto {
     config_dto(&state.config.lock().unwrap())
-}
-
-#[tauri::command]
-fn save_base_url(state: State<AppState>, base_url: String) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    cfg.base_url = normalize_base_url(&base_url);
-    cfg.save(&state.config_path).map_err(|e| e.to_string())
-}
-
-/// Usuário digita "www.pokersync.com.br", ou até "pokersync.com.br/" —
-/// sem "https://" na frente a URL não é absoluta e o reqwest recusa
-/// montar a requisição ("builder error" na UI, sem explicar o motivo).
-/// Aceitamos o que o usuário digitar e completamos o esquema.
-fn normalize_base_url(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
-    }
 }
 
 #[tauri::command]
@@ -136,12 +111,9 @@ fn start_google_login(app: AppHandle, state: State<AppState>) -> Result<(), Stri
         .collect();
     *state.pending_google_state.lock().unwrap() = Some(nonce.clone());
 
-    let (base_url, device_name) = {
-        let cfg = state.config.lock().unwrap();
-        (cfg.base_url.clone(), cfg.device_name.clone())
-    };
-    let mut url = url::Url::parse(&format!("{base_url}/agent-login"))
-        .map_err(|e| format!("URL do PokerSync inválida: {e}"))?;
+    let device_name = state.config.lock().unwrap().device_name.clone();
+    let mut url = url::Url::parse(&format!("{}/agent-login", config::DEFAULT_BASE_URL))
+        .expect("DEFAULT_BASE_URL é uma URL fixa e válida");
     url.query_pairs_mut()
         .append_pair("state", &nonce)
         .append_pair("device", &device_name);
@@ -203,8 +175,7 @@ async fn complete_google_login(app: AppHandle, code: String, received_state: Str
         return;
     }
 
-    let base_url = state.config.lock().unwrap().base_url.clone();
-    let result = match auth::exchange_login_code(&base_url, &code).await {
+    let result = match auth::exchange_login_code(config::DEFAULT_BASE_URL, &code).await {
         Ok(r) => r,
         Err(e) => {
             let _ = app.emit("google-login-result", serde_json::json!({ "ok": false, "error": e }));
@@ -242,16 +213,15 @@ fn logout(state: State<AppState>) -> Result<ConfigDto, String> {
     Ok(config_dto(&cfg))
 }
 
+/// Sempre contra o domínio de produção (`config::DEFAULT_BASE_URL`) —
+/// não existe mais campo de URL editável na UI, então não há "outro
+/// site" pra testar.
 #[tauri::command]
-async fn test_connection(state: State<'_, AppState>) -> Result<String, String> {
-    let base_url = state.config.lock().unwrap().base_url.clone();
-    if base_url.is_empty() {
-        return Err("Configure a URL do PokerSync antes de testar.".into());
-    }
+async fn test_connection(_state: State<'_, AppState>) -> Result<String, String> {
     let token = keychain::load()
         .ok_or("Faça login antes de testar a conexão.")?
         .access_token;
-    let client = SyncClient::new(base_url, token);
+    let client = SyncClient::new(config::DEFAULT_BASE_URL, token);
     client.ping().await.map_err(|e| e.to_string())?;
     Ok("Conectado.".to_string())
 }
@@ -365,7 +335,7 @@ struct SyncSummary {
     errors: u32,
 }
 
-async fn refresh_client(base_url: &str) -> Result<SyncClient, String> {
+async fn refresh_client() -> Result<SyncClient, String> {
     let refresh_token = keychain::load()
         .ok_or("Sessão expirada — faça login novamente.")?
         .refresh_token;
@@ -374,7 +344,7 @@ async fn refresh_client(base_url: &str) -> Result<SyncClient, String> {
         access_token: result.access_token.clone(),
         refresh_token: result.refresh_token,
     })?;
-    Ok(SyncClient::new(base_url.to_string(), result.access_token))
+    Ok(SyncClient::new(config::DEFAULT_BASE_URL, result.access_token))
 }
 
 /// Sincroniza um tipo de arquivo (mãos ou torneios) em todas as salas.
@@ -382,11 +352,8 @@ async fn refresh_client(base_url: &str) -> Result<SyncClient, String> {
 /// sync automático em background (`spawn_auto_sync`) — mesma lógica,
 /// evita os dois caminhos divergirem.
 async fn sync_kind(state: &AppState, kind: FileKind) -> Result<Vec<SyncSummary>, String> {
-    let (base_url, token, device) = {
+    let (token, device) = {
         let cfg = state.config.lock().unwrap();
-        if cfg.base_url.is_empty() {
-            return Err("Configure a URL do PokerSync antes de sincronizar.".into());
-        }
         let token = keychain::load()
             .ok_or("Faça login antes de sincronizar.")?
             .access_token;
@@ -396,9 +363,9 @@ async fn sync_kind(state: &AppState, kind: FileKind) -> Result<Vec<SyncSummary>,
             platform: std::env::consts::OS.to_string(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
         };
-        (cfg.base_url.clone(), token, device)
+        (token, device)
     };
-    let mut client = SyncClient::new(base_url.clone(), token);
+    let mut client = SyncClient::new(config::DEFAULT_BASE_URL, token);
     // Sessão do agente pode ter expirado desde o login — renova uma vez com
     // o refresh_token e recria o client, em vez de forçar login manual de
     // novo a cada sync.
@@ -441,7 +408,7 @@ async fn sync_kind(state: &AppState, kind: FileKind) -> Result<Vec<SyncSummary>,
                     if let Err(sync_client::SyncError::Rejected { status: 401, .. }) = &attempt {
                         if !already_refreshed {
                             already_refreshed = true;
-                            client = refresh_client(&base_url).await?;
+                            client = refresh_client().await?;
                             attempt = client.sync_batch(&device, room.slug(), &batch_files).await;
                         }
                     }
@@ -453,7 +420,7 @@ async fn sync_kind(state: &AppState, kind: FileKind) -> Result<Vec<SyncSummary>,
                     if let Err(sync_client::SyncError::Rejected { status: 401, .. }) = &attempt {
                         if !already_refreshed {
                             already_refreshed = true;
-                            client = refresh_client(&base_url).await?;
+                            client = refresh_client().await?;
                             attempt = client.sync_tournament_batch(&device, room.slug(), &batch_files).await;
                         }
                     }
@@ -490,7 +457,7 @@ async fn sync_now(state: State<'_, AppState>, kind: String) -> Result<Vec<SyncSu
 
 /// Sync automático em background: dispara mãos + torneios a cada
 /// `AUTO_SYNC_INTERVAL`, sem depender do jogador clicar em nada. Falha
-/// silenciosamente (não logado, sem rede, URL não configurada) — não é
+/// silenciosamente (não logado, sem rede) — não é
 /// pra encher a tela de erro por um laço que roda sozinho; erros reais
 /// ainda aparecem quando o jogador abre a janela e vê "há X sem
 /// sincronizar" nunca mudar. Emite `auto-sync-result` só quando dá certo
@@ -638,7 +605,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
-            save_base_url,
             save_device_name,
             save_extra_folders,
             set_auto_sync_enabled,
@@ -655,27 +621,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("erro ao rodar o app Tauri");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_base_url;
-
-    #[test]
-    fn adds_https_when_scheme_missing() {
-        assert_eq!(normalize_base_url("www.pokersync.com.br"), "https://www.pokersync.com.br");
-        assert_eq!(normalize_base_url("pokersync.com.br/"), "https://pokersync.com.br");
-    }
-
-    #[test]
-    fn keeps_explicit_scheme() {
-        assert_eq!(normalize_base_url("https://app.pokersync.com/"), "https://app.pokersync.com");
-        assert_eq!(normalize_base_url("http://localhost:3000"), "http://localhost:3000");
-    }
-
-    #[test]
-    fn trims_whitespace_and_empty() {
-        assert_eq!(normalize_base_url("  www.pokersync.com.br  "), "https://www.pokersync.com.br");
-        assert_eq!(normalize_base_url("   "), "");
-    }
 }

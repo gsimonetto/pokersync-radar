@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# rustls-tls-native-roots (não rustls-tls puro): ver o comentário
+# equivalente em src-tauri/Cargo.toml -- mesma razão, aqui pras
+# chamadas a /api/agent/* em vez de ao Supabase.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 thiserror = "1"
 
 [dev-dependencies]

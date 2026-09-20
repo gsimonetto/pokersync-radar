@@ -154,9 +154,13 @@ impl SyncClient {
             .await
             .map_err(|e| SyncError::BadResponse(e.to_string()))?;
         if !status.is_success() {
+            // O backend manda "error" (código curto, ex.: "IMPORT_SCOPE_NAO_DEFINIDO")
+            // e, em alguns casos, um "message" com o texto amigável pro usuário —
+            // prefere o "message" quando existir, senão cai pro "error".
             let message = value
-                .get("error")
+                .get("message")
                 .and_then(|v| v.as_str())
+                .or_else(|| value.get("error").and_then(|v| v.as_str()))
                 .unwrap_or("erro desconhecido")
                 .to_string();
             return Err(SyncError::Rejected {

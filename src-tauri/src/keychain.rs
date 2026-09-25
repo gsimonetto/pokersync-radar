@@ -1,41 +1,37 @@
-//! Tokens de sessão (access + refresh) guardados no keychain nativo do SO
-//! — Windows Credential Manager, macOS Keychain, Secret Service no Linux —
-//! em vez de arquivo texto plano. O resto da config (URL, device, pastas)
-//! não é segredo e continua em `config.rs`.
+//! Chave de renovação da sessão guardada no keychain nativo do SO —
+//! Windows Credential Manager, macOS Keychain, Secret Service no Linux —
+//! em vez de arquivo texto plano. O resto da config (device, pastas) não é
+//! segredo e continua em `config.rs`.
 //!
-//! O Windows Credential Manager recusa uma "senha" com mais de 2560
-//! *bytes* (erro "Attribute 'password encoded as UTF-16' is longer than
-//! platform limit of 2560 chars" — a mensagem fala em "chars", mas o
-//! `keyring` mede `password.encode_utf16().count() * 2`, ou seja, bytes
-//! de UTF-16: 2 por caractere ASCII. Isso dá só ~1280 caracteres de
-//! verdade por entrada, bem menos do que os "2560 chars" que a mensagem
-//! sugere) — e o JSON com os dois tokens juntos passa disso com folga
-//! quando o access_token é um JWT grande. Por isso guardamos em pedaços
-//! menores, um por entrada do keychain, em vez de um bloco só.
+//! Desde a 0.2.0 só a chave de RENOVAÇÃO fica aqui. A chave de acesso (um
+//! JWT grande, que vence em ~1 hora) vive só na memória do app e é
+//! renovada ao abrir. Antes as duas iam juntas num JSON que passava do
+//! limite do Windows Credential Manager (2560 bytes em UTF-16) e precisava
+//! ser picado em vários pedaços — gravar vários pedaços não é atômico, e
+//! um desligamento no meio da gravação deixava o login corrompido. A chave
+//! de renovação é curta e cabe numa entrada só.
+//!
+//! As funções de leitura dos formatos antigos continuam aqui só pra quem
+//! atualiza da 0.1.x não precisar entrar de novo.
 
 use keyring::Entry;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 const SERVICE: &str = "com.pokersync.radar";
-/// Nome usado antes do app virar "Radar PokerSync" — mantido só de leitura
-/// pra quem já tinha feito login não ser deslogado na atualização.
+const ACCOUNT_REFRESH: &str = "refresh-token";
+
+/// Formatos antigos (0.1.x): JSON {access_token, refresh_token} em pedaços
+/// ("session-chunk-N" + "session-chunk-count"), numa entrada só
+/// ("session") ou no serviço de antes do rename pra "Radar PokerSync".
 const SERVICE_LEGACY: &str = "com.pokersync.agent";
 const ACCOUNT_LEGACY: &str = "session";
 const ACCOUNT_COUNT: &str = "session-chunk-count";
-
-/// O limite real do Windows é 2560 *bytes* em UTF-16 (2 bytes por
-/// caractere ASCII) — ou seja, ~1280 caracteres, não 2560. 1000 fica bem
-/// abaixo disso, com margem pra outros SOs (mais folgados) e pra
-/// variação de encoding.
-const CHUNK_SIZE: usize = 1000;
-/// Trava de segurança contra um número de pedaços absurdo (ex.: entrada
-/// de contagem corrompida) — nenhum token real chega perto disso.
+/// Trava contra uma contagem de pedaços corrompida.
 const MAX_CHUNKS: usize = 50;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tokens {
-    pub access_token: String,
-    pub refresh_token: String,
+#[derive(Debug, Deserialize)]
+struct LegacyTokens {
+    refresh_token: String,
 }
 
 fn entry(account: &str) -> Result<Entry, String> {
@@ -55,146 +51,89 @@ fn read_chunk_count() -> Option<usize> {
     raw.parse::<usize>().ok().filter(|n| *n <= MAX_CHUNKS)
 }
 
-fn load_chunked() -> Option<Tokens> {
+fn load_chunked() -> Option<String> {
     let count = read_chunk_count()?;
     let mut raw = String::new();
     for i in 0..count {
         raw.push_str(&entry(&chunk_account(i)).ok()?.get_password().ok()?);
     }
-    serde_json::from_str(&raw).ok()
+    Some(raw)
 }
 
-/// Sessões salvas antes dessa correção (formato antigo) ou antes do app
-/// virar "Radar PokerSync" (nome/serviço antigo) — sem isso, todo mundo
-/// que já tinha logado seria deslogado na próxima atualização do agente.
-fn load_legacy() -> Option<Tokens> {
+fn load_legacy_single() -> Option<String> {
     let same_service = entry(ACCOUNT_LEGACY).ok().and_then(|e| e.get_password().ok());
-    let old_service = legacy_entry().ok().and_then(|e| e.get_password().ok());
-    let raw = same_service.or(old_service)?;
-    serde_json::from_str(&raw).ok()
+    same_service.or_else(|| legacy_entry().ok().and_then(|e| e.get_password().ok()))
+}
+
+fn refresh_from_legacy_json(raw: &str) -> Option<String> {
+    serde_json::from_str::<LegacyTokens>(raw).ok().map(|t| t.refresh_token)
 }
 
 /// `None` tanto quando não há sessão salva quanto quando o backend do
 /// keychain falha (ex.: ambiente sem Secret Service no Linux) — nesse caso
 /// o app trata como "não logado" e pede login de novo, em vez de travar.
-pub fn load() -> Option<Tokens> {
-    load_chunked().or_else(load_legacy)
+pub fn load_refresh_token() -> Option<String> {
+    if let Some(token) = entry(ACCOUNT_REFRESH).ok().and_then(|e| e.get_password().ok()) {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    load_chunked()
+        .and_then(|raw| refresh_from_legacy_json(&raw))
+        .or_else(|| load_legacy_single().and_then(|raw| refresh_from_legacy_json(&raw)))
 }
 
-fn split_into_chunks(raw: &str) -> Vec<String> {
-    let chars: Vec<char> = raw.chars().collect();
-    chars.chunks(CHUNK_SIZE).map(|c| c.iter().collect()).collect()
+fn delete(entry: Result<Entry, String>) -> Result<(), String> {
+    match entry?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
-pub fn save(tokens: &Tokens) -> Result<(), String> {
-    let raw = serde_json::to_string(tokens).map_err(|e| e.to_string())?;
-    let chunks = split_into_chunks(&raw);
-    // Não deveria acontecer com tokens reais, mas mais vale falhar com uma
-    // mensagem clara do que gravar pela metade.
-    if chunks.len() > MAX_CHUNKS {
-        return Err(format!(
-            "Sessão grande demais para o keychain ({} pedaços).",
-            chunks.len()
-        ));
+fn delete_legacy() {
+    let count = read_chunk_count().unwrap_or(MAX_CHUNKS.min(8));
+    for i in 0..count {
+        let _ = delete(entry(&chunk_account(i)));
     }
+    let _ = delete(entry(ACCOUNT_COUNT));
+    let _ = delete(entry(ACCOUNT_LEGACY));
+    let _ = delete(legacy_entry());
+}
 
-    let previous_count = read_chunk_count().unwrap_or(0);
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        entry(&chunk_account(i))?
-            .set_password(chunk)
-            .map_err(|e| e.to_string())?;
-    }
-    entry(ACCOUNT_COUNT)?
-        .set_password(&chunks.len().to_string())
+/// Uma gravação só (atômica do ponto de vista do app). Depois de gravar,
+/// apaga os formatos antigos pra não deixar chave velha parada no cofre.
+pub fn save_refresh_token(refresh_token: &str) -> Result<(), String> {
+    entry(ACCOUNT_REFRESH)?
+        .set_password(refresh_token)
         .map_err(|e| e.to_string())?;
-
-    // Sessão nova tem menos pedaços que a anterior (ex.: refresh_token
-    // encolheu) — limpa o que sobrou pra não ficar lixo nem confundir uma
-    // leitura futura com contagem errada.
-    for i in chunks.len()..previous_count {
-        let _ = entry(&chunk_account(i)).and_then(|e| match e.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(err.to_string()),
-        });
-    }
-
-    // Migração: uma vez salvo no formato novo, as entradas antigas (formato
-    // de senha única e/ou nome de serviço de antes do rename) não servem
-    // mais pra nada — remove pra não deixar token velho parado no cofre do SO.
-    let _ = entry(ACCOUNT_LEGACY).and_then(|e| match e.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(err) => Err(err.to_string()),
-    });
-    let _ = legacy_entry().and_then(|e| match e.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(err) => Err(err.to_string()),
-    });
-
+    delete_legacy();
     Ok(())
 }
 
 pub fn clear() -> Result<(), String> {
-    let count = read_chunk_count().unwrap_or(0);
-    for i in 0..count {
-        match entry(&chunk_account(i))?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    match entry(ACCOUNT_COUNT)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(e) => return Err(e.to_string()),
-    }
-    match entry(ACCOUNT_LEGACY)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(e) => return Err(e.to_string()),
-    }
-    match legacy_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    delete_legacy();
+    delete(entry(ACCOUNT_REFRESH))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Mesmo limite que o Windows aplica de verdade (`CRED_MAX_CREDENTIAL_BLOB_SIZE`
-    /// no crate `keyring`) — em *bytes* de UTF-16, não em caracteres. Isso já
-    /// mordeu a gente uma vez: um `CHUNK_SIZE` "abaixo de 2560" mas medido em
-    /// caracteres ainda estourava o limite real, que é a metade disso.
+    /// Limite real do Windows Credential Manager, em bytes de UTF-16.
     const CRED_MAX_CREDENTIAL_BLOB_SIZE_BYTES: usize = 2560;
 
     #[test]
-    fn chunks_never_exceed_windows_real_byte_limit() {
-        let raw = serde_json::to_string(&Tokens {
-            access_token: "a".repeat(5000),
-            refresh_token: "r".repeat(500),
-        })
-        .unwrap();
-
-        let chunks = split_into_chunks(&raw);
-        assert!(chunks.len() > 1, "esperava mais de um pedaço pra esse tamanho");
-        for chunk in &chunks {
-            let utf16_bytes = chunk.encode_utf16().count() * 2;
-            assert!(
-                utf16_bytes <= CRED_MAX_CREDENTIAL_BLOB_SIZE_BYTES,
-                "pedaço com {utf16_bytes} bytes UTF-16 estoura o limite real do Windows ({CRED_MAX_CREDENTIAL_BLOB_SIZE_BYTES})"
-            );
-        }
+    fn refresh_tokens_fit_in_a_single_windows_entry() {
+        // O Supabase emite chaves de renovação curtas (dezenas de
+        // caracteres); 500 já é uma folga enorme e ainda cabe.
+        let token = "r".repeat(500);
+        assert!(token.encode_utf16().count() * 2 <= CRED_MAX_CREDENTIAL_BLOB_SIZE_BYTES);
     }
 
     #[test]
-    fn chunks_reassemble_into_original() {
-        let raw = serde_json::to_string(&Tokens {
-            access_token: "x".repeat(3333),
-            refresh_token: "refresh-token-normal".to_string(),
-        })
-        .unwrap();
-
-        let chunks = split_into_chunks(&raw);
-        let rejoined: String = chunks.concat();
-        assert_eq!(rejoined, raw);
+    fn reads_refresh_token_from_legacy_json() {
+        let raw = r#"{"access_token":"a.b.c","refresh_token":"abc123"}"#;
+        assert_eq!(refresh_from_legacy_json(raw).as_deref(), Some("abc123"));
+        assert_eq!(refresh_from_legacy_json("lixo"), None);
     }
 }

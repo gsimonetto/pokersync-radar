@@ -28,6 +28,13 @@
           <p>Entre com a sua conta PokerSync pra começar a sincronizar.</p>
         </div>
 
+        <!-- Aparece quando a sessão venceu (o Radar parou de sincronizar
+             por isso) — antes a tela continuava "logada" e o envio falhava
+             calado. Ver sessao_expirou em src-tauri/src/lib.rs. -->
+        <div id="login-aviso" class="login-aviso hidden">
+          Sua sessão expirou e o Radar parou de sincronizar. Entre de novo pra ele voltar a enviar suas mãos.
+        </div>
+
         <form id="login-form">
           <div class="field">
             <label for="email">Email</label>
@@ -121,7 +128,7 @@
             <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></span>
             <div>
               <h3>Sincronização contínua</h3>
-              <p>Toda sessão nova vira dado pronto pra revisão — o agente só envia o que mudou desde a última vez.</p>
+              <p>Toda sessão nova vira dado pronto pra revisão — o Radar só envia o que mudou desde a última vez.</p>
             </div>
           </div>
           <div class="value-item">
@@ -135,7 +142,57 @@
       </div>
 
       <div class="section-heading"><h2>Importação</h2></div>
-      <div id="auto-sync-status" class="auto-sync-status"></div>
+
+      <!-- Situação do Radar agora: conectado/sincronizando, sem internet,
+           o que falta no site (escolher o que importar, plano) e quando
+           foi a última verificação. Montado por renderStatus em app.js a
+           partir do evento "status-changed". -->
+      <div id="status-card" class="status-card">
+        <div class="status-linha">
+          <span id="status-ponto" class="status-ponto"></span>
+          <div class="status-textos">
+            <div id="status-titulo" class="status-titulo">Conectando ao PokerSync…</div>
+            <div id="status-detalhe" class="status-detalhe"></div>
+          </div>
+          <button type="button" id="btn-sync-agora" class="btn btn-secondary btn-sm">Sincronizar agora</button>
+        </div>
+        <div id="status-aviso" class="status-aviso hidden">
+          <span id="status-aviso-texto"></span>
+          <button type="button" id="btn-status-aviso" class="btn btn-primary btn-sm"></button>
+        </div>
+
+        <!-- Pergunta "o que importar" (pedido explícito: a escolha fica no
+             Radar e no site) — aparece enquanto o jogador não respondeu,
+             com os números do que o Radar achou no computador. Mesma
+             escolha da página do Radar no site. -->
+        <div id="escolha-importacao" class="escolha hidden">
+          <div class="escolha-titulo">O que o Radar deve trazer?</div>
+          <div id="escolha-resumo" class="escolha-resumo">Procurando mãos no seu computador…</div>
+          <div class="escolha-opcoes">
+            <button type="button" class="escolha-opcao" data-escopo="from_now">
+              <span class="escolha-opcao-titulo">Só de agora em diante</span>
+              <span class="escolha-opcao-texto" data-texto="from_now">Nada do que já está no computador — só as mãos que você jogar a partir de agora.</span>
+            </button>
+            <button type="button" class="escolha-opcao" data-escopo="last_3_months">
+              <span class="escolha-opcao-titulo">Os últimos 3 meses</span>
+              <span class="escolha-opcao-texto" data-texto="last_3_months">O que você jogou nos últimos 3 meses, e tudo daqui pra frente.</span>
+            </button>
+            <button type="button" class="escolha-opcao" data-escopo="full_history">
+              <span class="escolha-opcao-titulo">Tudo</span>
+              <span class="escolha-opcao-texto" data-texto="full_history">Todo o histórico que está no computador, e tudo daqui pra frente.</span>
+            </button>
+          </div>
+          <div class="escolha-rodape">Dá pra trocar depois na página do Radar no site. Se ampliar (por exemplo, de "só de agora" pra "tudo"), o Radar manda sozinho o que faltou.</div>
+          <div id="escolha-erro" class="status-msg err hidden"></div>
+        </div>
+        <div class="status-autostart">
+          <div>
+            <div class="settings-row-label">Abrir junto com o computador</div>
+            <div class="settings-row-hint">O Radar liga sozinho quando você liga o PC e fica perto do relógio, sincronizando.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="autostart-toggle" /><span class="slider"></span></label>
+        </div>
+      </div>
 
       <div class="import-buttons">
         <button type="button" class="import-btn" id="btn-open-hands" data-kind="hands">
@@ -200,14 +257,6 @@
             <div class="settings-row-hint">Verifica e envia mãos/torneios novos sozinho, a cada poucos minutos — sem precisar clicar em nada.</div>
           </div>
           <label class="switch"><input type="checkbox" id="auto-sync-toggle" /><span class="slider"></span></label>
-        </div>
-
-        <div class="settings-row">
-          <div>
-            <div class="settings-row-label">Iniciar com o sistema</div>
-            <div class="settings-row-hint">Abre minimizado na bandeja ao ligar o computador.</div>
-          </div>
-          <label class="switch"><input type="checkbox" id="autostart-toggle" /><span class="slider"></span></label>
         </div>
 
         <div class="settings-row">

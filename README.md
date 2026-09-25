@@ -37,7 +37,12 @@ Do lado do produto, em `gsimonetto/pokersync` (`app/`, `lib/`):
 
 - `app/api/agent/sync/route.ts` — recebe o texto bruto, autentica por
   bearer token (Supabase JWT do usuário).
-- `app/api/agent/ping/route.ts` — valida token/conectividade.
+- `app/api/agent/ping/route.ts` — valida o token e recebe o "sinal de
+  vida" do Radar (POST com o aparelho, a cada ciclo); responde o que o
+  jogador escolheu importar (`importScope`) e se o plano inclui o Radar
+  (`radarLiberado`).
+- `app/api/agent/import-scope/route.ts` — salva a escolha do que importar
+  feita dentro do Radar (mesma escolha da página do Radar no site).
 - `lib/services/agent-sync-service.ts` — parseia (via `hand-parser.ts`),
   deduplica por `external_hand_id` e grava em `hand_reviews` (`source:
   "agent"`), atualizando `hand_sync_devices`/`hand_sync_batches`.
@@ -54,12 +59,34 @@ Do lado do produto, em `gsimonetto/pokersync` (`app/`, `lib/`):
    marcadores do parser). PartyPoker/888poker/ACR usam uma heurística mais
    fraca hoje, documentada em `crates/scanner/src/room.rs`.
 3. `SyncState` (um JSON por sala, em `app_config_dir()/sync-state/`) guarda
-   tamanho+mtime de cada arquivo já sincronizado — só o que mudou desde a
-   última vez é relido e reenviado.
-4. O texto bruto vai pro backend em lotes de até 50 arquivos
-   (`DEFAULT_BATCH_SIZE`); o backend separa múltiplas mãos por arquivo
-   (`splitHands`) e deduplica por `external_hand_id` (o handId real, com
-   fallback pra hash do texto quando o parser não reconhece o formato).
+   tamanho+mtime de cada arquivo já sincronizado e quanto do texto já foi
+   enviado — de um arquivo que cresceu (sessão rolando) só vai o trecho
+   novo, a partir da última mão enviada (`scanner::text::new_part_since`).
+4. Os arquivos são lidos em qualquer codificação comum (UTF-8, UTF-16,
+   Windows-1252 — `scanner::text::decode_text`) e enviados em lotes que
+   respeitam os limites do servidor (Vercel): até 50 arquivos e ~3 MB por
+   envio; arquivo de mãos maior que 2 MB vai em partes, sempre cortadas no
+   começo de uma mão (`sync_client::BatchBuilder`,
+   `scanner::text::split_into_parts`). O progresso é salvo a cada lote
+   aceito. O backend separa as mãos (`splitHands`) e deduplica por
+   `external_hand_id`.
+5. O corte do que importar ("só de agora em diante", "últimos 3 meses" ou
+   "tudo") é aplicado no site. Quando o jogador AMPLIA a escolha, o Radar
+   esquece o que já tinha enviado e manda de novo (`lembrar_escopo` em
+   `src-tauri/src/lib.rs`) — senão o histórico que tinha ficado de fora
+   nunca chegaria.
+
+## Ciclo automático
+
+`spawn_ciclo_automatico` (em `src-tauri/src/lib.rs`) roda logo ao abrir e
+depois a cada 5 minutos: confere a sessão (renova se preciso), manda o
+sinal de vida e, se estiver tudo liberado, envia mãos e torneios novos.
+Sem internet (ex.: logo depois de ligar o PC), tenta de novo em 20 s,
+40 s, 80 s… até o intervalo normal. Um envio por vez (`sync_lock`): o
+automático e o "Sincronizar agora" nunca rodam juntos. A tela mostra a
+situação (`status-changed`): tudo certo, sem internet, falta escolher o
+que importar (a pergunta aparece ali mesmo, com os números do que o
+Radar achou no computador), plano sem Radar ou sessão vencida.
 
 ## Autenticação
 
@@ -79,29 +106,37 @@ Dois caminhos, ambos contra o mesmo GoTrue do produto web:
   volta impede que um deep link de outra origem seja aceito como se
   fosse resposta desse login.
 
-Em ambos os casos, os tokens resultantes (access + refresh) ficam no
-keychain nativo do SO (`keychain.rs`, via crate `keyring`: Windows
-Credential Manager, macOS Keychain, Secret Service no Linux) — nunca em
-disco em texto plano. O resto da config (URL, device, pastas) não é
-segredo e continua em `config.json`. Próximo passo natural: um fluxo de
-pareamento por código de uso único (sem precisar de email/senha nem
-depender do navegador do sistema), gerado em `/time` no produto.
+Em ambos os casos, só a chave de RENOVAÇÃO fica no keychain nativo do SO
+(`keychain.rs`, via crate `keyring`: Windows Credential Manager, macOS
+Keychain, Secret Service no Linux) — numa entrada só, nunca em disco em
+texto plano. A chave de acesso (JWT de ~1 h) vive só na memória e é
+renovada ao abrir. Se o Supabase recusar a chave de renovação, o Radar
+limpa a sessão, avisa com notificação e mostra "Sua sessão expirou" na tela
+de login (`sessao_expirou`); sem internet ele só tenta de novo depois,
+sem deslogar. "Sair" encerra também a sessão deste Radar no servidor.
+
+No Windows/Linux o link de volta do login com Google abre o programa de
+novo — `tauri-plugin-single-instance` (com o recurso `deep-link`) repassa
+o link pra cópia que já está rodando e fecha a segunda. O esquema fica em
+`plugins.deep-link.desktop.schemes` no `tauri.conf.json` (fora de
+`desktop`, o plugin ignora e nada é registrado).
 
 ## URL do PokerSync
 
 O domínio de produção (`DEFAULT_BASE_URL` em `config.rs`) vem embutido no
-binário — o jogador nunca vê nem precisa configurar isso. O campo "URL do
-PokerSync" só existe dentro de "Configurações avançadas" (escondido por
-padrão), pra depuração (ambiente de teste, self-host).
+binário — o jogador nunca vê nem precisa configurar isso. Só no build de
+desenvolvimento (`cargo build`, nunca no instalador) dá pra apontar pra um
+servidor de teste local: `RADAR_DEV_SITE_URL`, `RADAR_DEV_SUPABASE_URL`,
+`RADAR_DEV_REFRESH_TOKEN` e `RADAR_DEV_INTERVAL_SECS`.
 
 ## Bandeja do sistema e início automático
 
-Fechar a janela minimiza pra bandeja em vez de encerrar o processo — o
-agente é feito pra ficar rodando em background. O menu da bandeja (ícone
-perto do relógio) tem "Mostrar" e "Sair" — só "Sair" encerra de verdade. O
-toggle "Iniciar automaticamente com o sistema" em Configurações avançadas
-liga o autostart do SO (`tauri-plugin-autostart`); quando o SO abre o app
-sozinho no login, ele já nasce minimizado na bandeja (flag `--hidden`).
+Fechar a janela esconde em vez de encerrar o processo — o Radar é feito pra
+ficar rodando em background. Clique no ícone perto do relógio abre a
+janela; o menu (botão direito) tem "Abrir o Radar", "Sincronizar agora" e
+"Fechar o Radar". "Abrir junto com o computador" (`tauri-plugin-autostart`)
+liga sozinho no primeiro login e fica na tela principal pra desligar;
+quando o SO abre o app no login, ele nasce só no ícone (flag `--hidden`).
 
 ## Rodando localmente
 
@@ -149,8 +184,9 @@ cada sala pra substituir.
   `raw_payload` com `parsed_data` best-effort até o parser ganhar suporte
   a esses formatos — `hand-parser.ts` hoje nem reconhece o texto de hand
   history dessas três salas, é o maior gap real da varredura hoje).
-- Ícone de verdade (hoje é um placeholder azul sólido) e assinatura de
-  código por SO (sem isso, Windows/macOS mostram aviso de "app não
-  verificado" ao instalar).
-- Watcher automático em background (hoje é scan sob demanda, acionado pela
-  UI ou manualmente) em vez de só ficar disponível na bandeja.
+- Assinatura de código por SO (sem isso, Windows/macOS mostram aviso de
+  "app não verificado" ao instalar). O ícone (cartas do logo PokerSync) já
+  é o definitivo: `src-tauri/icons/`, com versão simplificada pros
+  tamanhos pequenos.
+- Avisar na hora em que o arquivo muda (hoje o ciclo automático confere a
+  cada 5 minutos).

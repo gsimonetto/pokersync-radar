@@ -1,8 +1,8 @@
 name: Release
 
 # Gera os instaladores do Radar PokerSync por SO e publica como GitHub
-# Release (draft) com os binários anexados — o jeito mais simples de testar
-# sem precisar instalar Rust/Tauri localmente.
+# Release oficial (a "latest", que o auto-update e o botão de download do
+# site usam) com os instaladores, as assinaturas e o latest.json.
 #
 # Disparo manual (Actions -> Release -> Run workflow): usa a versão que
 # estiver commitada em src-tauri/tauri.conf.json (bom pra builds de teste).
@@ -54,6 +54,7 @@ jobs:
           echo "Versão do bundle: $VERSION"
 
       - uses: tauri-apps/tauri-action@v0
+        id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Assina os artefatos de auto-update (arquivo .sig por
@@ -67,11 +68,37 @@ jobs:
           tagName: v__VERSION__
           releaseName: "Radar PokerSync v__VERSION__"
           releaseBody: |
-            Nova versão do Radar PokerSync. Instale ou deixe o auto-update
-            cuidar disso a partir da próxima abertura do app.
+            Nova versão do Radar PokerSync.
+
+            Quem já tem o Radar 0.2.0 ou mais novo recebe esta versão sozinho (aparece "Nova versão disponível" na tela do Radar).
+            Pra instalar pela primeira vez, use o botão "Baixar" na página do Radar em pokersync.com.br.
           # Publicada de verdade (não-draft, não-prerelease): o
           # auto-update olha pra release "latest" do repositório, então
           # uma tag vX.Y.Z já entrega a atualização pros usuários assim
           # que o build termina.
           releaseDraft: false
           prerelease: false
+          # O botão de download do site entrega o instalador .exe (NSIS);
+          # a atualização automática tem que usar o mesmo tipo, senão o
+          # Windows acaba com duas instalações (uma .exe e uma .msi).
+          updaterJsonPreferNsis: true
+
+      # Cópia de cada instalador com nome FIXO (sem número de versão) — o
+      # botão "Baixar" do site aponta pra
+      # releases/latest/download/Radar-PokerSync-<SO>.<ext>, que nunca muda
+      # de uma versão pra outra. Antes o site mandava pra página do GitHub,
+      # com 7 arquivos e nome antigo.
+      - name: Publica instalador com nome fixo pro botão de download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.tauri.outputs.appVersion }}
+        run: |
+          case "${{ matrix.platform }}" in
+            windows-latest) ORIGEM=$(find target -path '*/bundle/nsis/*-setup.exe' | head -1); DESTINO=Radar-PokerSync-Windows.exe ;;
+            macos-latest)   ORIGEM=$(find target -path '*/bundle/dmg/*.dmg' | head -1);        DESTINO=Radar-PokerSync-Mac.dmg ;;
+            *)              ORIGEM=$(find target -path '*/bundle/appimage/*.AppImage' | head -1); DESTINO=Radar-PokerSync-Linux.AppImage ;;
+          esac
+          if [ -z "$ORIGEM" ]; then echo "Instalador não encontrado"; exit 1; fi
+          cp "$ORIGEM" "$DESTINO"
+          gh release upload "$TAG" "$DESTINO" --clobber --repo "$GITHUB_REPOSITORY"

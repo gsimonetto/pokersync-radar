@@ -14,9 +14,23 @@ pub struct FileSignature {
     pub modified_unix: i64,
 }
 
+/// Quanto do texto (já decodificado) de um arquivo foi enviado, e a
+/// impressão digital desse trecho — permite mandar só o que foi anexado
+/// depois (ver `text::new_part_since`), em vez do arquivo inteiro de novo a
+/// cada varredura enquanto uma sessão está rolando.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentText {
+    pub len: u64,
+    pub fingerprint: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SyncState {
     synced_files: HashMap<PathBuf, FileSignature>,
+    /// Ausente em arquivos de estado antigos (antes da 0.2.0) — nesse caso o
+    /// próximo envio de um arquivo que cresceu vai inteiro, como antes.
+    #[serde(default)]
+    sent_text: HashMap<PathBuf, SentText>,
 }
 
 impl SyncState {
@@ -32,7 +46,13 @@ impl SyncState {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self).unwrap_or_default();
-        fs::write(path, json)
+        // Grava num arquivo ao lado e troca de uma vez: se o PC desligar no
+        // meio, fica o estado anterior inteiro (no pior caso reenvia algo
+        // que o servidor descarta como repetido), nunca um arquivo pela
+        // metade que zeraria o progresso de tudo.
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)
     }
 
     /// Um arquivo precisa ser (re)sincronizado se nunca foi visto antes, ou
@@ -44,6 +64,16 @@ impl SyncState {
 
     pub fn mark_synced(&mut self, path: PathBuf, sig: FileSignature) {
         self.synced_files.insert(path, sig);
+    }
+
+    /// Igual a `mark_synced`, guardando também quanto do texto foi enviado.
+    pub fn mark_synced_text(&mut self, path: PathBuf, sig: FileSignature, sent: SentText) {
+        self.sent_text.insert(path.clone(), sent);
+        self.synced_files.insert(path, sig);
+    }
+
+    pub fn sent_text(&self, path: &Path) -> Option<SentText> {
+        self.sent_text.get(path).copied()
     }
 }
 
@@ -94,5 +124,35 @@ mod tests {
         std::fs::write(&file_path, "hello world, more hands appended").unwrap();
         let sig2 = signature_of(&file_path).unwrap();
         assert!(state.needs_sync(&file_path, sig2));
+    }
+
+    #[test]
+    fn loads_state_files_from_before_sent_text_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        std::fs::write(
+            &state_path,
+            r#"{"synced_files":{"/x/HH.txt":{"size":10,"modified_unix":5}}}"#,
+        )
+        .unwrap();
+        let state = SyncState::load(&state_path);
+        let sig = FileSignature { size: 10, modified_unix: 5 };
+        assert!(!state.needs_sync(Path::new("/x/HH.txt"), sig));
+        assert_eq!(state.sent_text(Path::new("/x/HH.txt")), None);
+    }
+
+    #[test]
+    fn remembers_how_much_text_was_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = SyncState::default();
+        let sig = FileSignature { size: 10, modified_unix: 5 };
+        let sent = SentText { len: 10, fingerprint: 42 };
+        state.mark_synced_text(PathBuf::from("/x/HH.txt"), sig, sent);
+        state.save(&state_path).unwrap();
+
+        let reloaded = SyncState::load(&state_path);
+        assert_eq!(reloaded.sent_text(Path::new("/x/HH.txt")), Some(sent));
+        assert!(!reloaded.needs_sync(Path::new("/x/HH.txt"), sig));
     }
 }

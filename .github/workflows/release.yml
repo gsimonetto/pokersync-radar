@@ -2,7 +2,9 @@ name: Release
 
 # Gera os instaladores do Radar PokerSync por SO e publica como GitHub
 # Release oficial (a "latest", que o auto-update e o botão de download do
-# site usam) com os instaladores, as assinaturas e o latest.json.
+# site usam) com os instaladores, as assinaturas e o latest.json. Sem a
+# chave de assinatura cadastrada nos secrets, sai tudo menos as assinaturas
+# e o latest.json (ver o passo "Confere a chave" e TAURI_UPDATER_SETUP.md).
 #
 # Disparo manual (Actions -> Release -> Run workflow): usa a versão que
 # estiver commitada em src-tauri/tauri.conf.json (bom pra builds de teste).
@@ -53,6 +55,33 @@ jobs:
           mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
           echo "Versão do bundle: $VERSION"
 
+      # Sem a chave de assinatura nos secrets, o Tauri não consegue assinar
+      # os arquivos de atualização e o build inteiro falhava ("Missing
+      # comment in secret key") — nenhum instalador saía. Agora os
+      # instaladores saem normalmente, só sem os arquivos de atualização
+      # automática (.sig + latest.json), e o resumo da execução avisa.
+      # Edita o JSON com node (a tauri-action já depende dele nos 3
+      # sistemas), não com jq.
+      - name: Confere a chave de assinatura das atualizações
+        id: chave
+        shell: bash
+        env:
+          CHAVE: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$CHAVE" ]; then
+            echo "assinar=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "assinar=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Secret TAURI_SIGNING_PRIVATE_KEY não cadastrado: instaladores gerados sem os arquivos de atualização (.sig/latest.json) — quem já tem o Radar não recebe esta versão sozinho. Ver TAURI_UPDATER_SETUP.md."
+            node -e '
+              const fs = require("fs");
+              const arquivo = "src-tauri/tauri.conf.json";
+              const conf = JSON.parse(fs.readFileSync(arquivo, "utf8"));
+              conf.bundle.createUpdaterArtifacts = false;
+              fs.writeFileSync(arquivo, JSON.stringify(conf, null, 2) + "\n");
+            '
+          fi
+
       - uses: tauri-apps/tauri-action@v0
         id: tauri
         env:
@@ -82,6 +111,8 @@ jobs:
           # a atualização automática tem que usar o mesmo tipo, senão o
           # Windows acaba com duas instalações (uma .exe e uma .msi).
           updaterJsonPreferNsis: true
+          # latest.json só com assinatura (ver "Confere a chave" acima).
+          includeUpdaterJson: ${{ steps.chave.outputs.assinar == 'true' }}
 
       # Cópia de cada instalador com nome FIXO (sem número de versão) — o
       # botão "Baixar" do site aponta pra

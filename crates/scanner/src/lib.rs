@@ -5,9 +5,10 @@
 
 pub mod room;
 pub mod state;
+pub mod text;
 
 pub use room::{FileKind, PokerRoom};
-pub use state::{signature_of, FileSignature, SyncState};
+pub use state::{signature_of, FileSignature, SentText, SyncState};
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -47,7 +48,24 @@ fn sniff_file(path: &Path, room: PokerRoom, kind: FileKind) -> bool {
         return false;
     };
     buf.truncate(n);
-    room.sniff_kind(kind, &String::from_utf8_lossy(&buf))
+    room.sniff_kind(kind, &text::decode_prefix(&buf))
+}
+
+/// Lê o arquivo inteiro em qualquer codificação comum (ver
+/// `text::decode_text`) — antes, arquivo que não fosse UTF-8 era pulado
+/// sem aviso.
+pub fn read_text(path: &Path) -> std::io::Result<String> {
+    Ok(text::decode_text(&std::fs::read(path)?))
+}
+
+/// Só os arquivos que mudaram desde o último envio, sem ler o conteúdo —
+/// quem chama lê um por vez (`read_text`), pra não carregar um histórico
+/// inteiro na memória de uma vez.
+pub fn pending_files<'a>(files: &'a [DiscoveredFile], state: &SyncState) -> Vec<&'a DiscoveredFile> {
+    files
+        .iter()
+        .filter(|f| state.needs_sync(&f.path, f.signature))
+        .collect()
 }
 
 /// Varre `roots` recursivamente procurando hand history (ou resumo de
@@ -93,11 +111,10 @@ pub fn discover_files(roots: &[PathBuf], room: PokerRoom, kind: FileKind) -> Vec
 /// Filtra `files` pelos que mudaram desde o último sync (via `state`) e lê
 /// o conteúdo inteiro só desses.
 pub fn read_pending(files: &[DiscoveredFile], state: &SyncState) -> Vec<PendingFile> {
-    files
-        .iter()
-        .filter(|f| state.needs_sync(&f.path, f.signature))
+    pending_files(files, state)
+        .into_iter()
         .filter_map(|f| {
-            std::fs::read_to_string(&f.path)
+            read_text(&f.path)
                 .ok()
                 .map(|content| PendingFile {
                     path: f.path.clone(),
@@ -210,5 +227,38 @@ mod tests {
         let tournaments = discover_files(&[dir.path().to_path_buf()], PokerRoom::PokerStars, FileKind::TournamentSummary);
         assert_eq!(tournaments.len(), 1);
         assert!(tournaments[0].path.ends_with("TS1234567890.txt"));
+    }
+
+    #[test]
+    fn finds_and_reads_utf16_hand_history() {
+        // Antes: arquivo em UTF-16 nem era reconhecido (o "cheiro" do
+        // começo vinha embaralhado) e, se fosse, era pulado na leitura.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "PokerStars Hand #77: Hold'em No Limit\nSeat 1: João\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let path = dir.path().join("HH utf16.txt");
+        std::fs::write(&path, bytes).unwrap();
+
+        let found = discover_files(&[dir.path().to_path_buf()], PokerRoom::PokerStars, FileKind::HandHistory);
+        assert_eq!(found.len(), 1);
+        let pending = read_pending(&found, &SyncState::default());
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].content.contains("Seat 1: João"));
+    }
+
+    #[test]
+    fn reads_latin1_file_instead_of_skipping() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"PokerStars Hand #78: Hold'em No Limit\nSeat 1: Jo".to_vec();
+        bytes.push(0xE3); // "ã" em Latin-1
+        bytes.extend_from_slice(b"o\n");
+        std::fs::write(dir.path().join("HH latin1.txt"), bytes).unwrap();
+
+        let found = discover_files(&[dir.path().to_path_buf()], PokerRoom::PokerStars, FileKind::HandHistory);
+        let pending = read_pending(&found, &SyncState::default());
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].content.contains("Seat 1: João"));
     }
 }

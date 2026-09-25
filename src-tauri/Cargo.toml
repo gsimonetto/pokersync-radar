@@ -16,7 +16,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 scanner = { path = "../crates/scanner" }
 sync-client = { path = "../crates/sync-client" }
 # rustls-tls-native-roots (não rustls-tls puro): "rustls-tls" confia só
@@ -33,6 +33,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-deep-link = "2"
+# "deep-link": no Windows/Linux o link de volta do login abre o programa de
+# novo — com isso ele é repassado pra cópia que já está rodando.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"

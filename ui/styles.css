@@ -279,23 +279,93 @@ body::after {
 }
 .update-banner span { color: var(--ink); }
 
-/* ---------- Importação (mãos / torneios) ---------- */
-.auto-sync-status {
-  font-size: 12px;
-  color: var(--positive);
+/* ---------- Situação do Radar (status-card) ---------- */
+.status-card {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  padding: 14px 16px;
   margin-bottom: 14px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
 }
-.auto-sync-status::before {
-  content: "";
-  width: 6px; height: 6px; border-radius: 999px;
-  background: var(--positive);
+.status-linha { display: flex; align-items: center; gap: 12px; }
+.status-ponto {
+  width: 9px; height: 9px; border-radius: 999px;
+  background: var(--muted);
   flex-shrink: 0;
 }
-.auto-sync-status.is-off { color: var(--muted); }
-.auto-sync-status.is-off::before { background: var(--muted); }
+.status-card[data-tom="ok"] .status-ponto { background: var(--positive); box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.15); }
+.status-card[data-tom="alerta"] .status-ponto { background: var(--evolution); box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.15); }
+.status-card[data-tom="erro"] .status-ponto { background: var(--negative); box-shadow: 0 0 0 4px rgba(224, 85, 90, 0.15); }
+.status-textos { flex: 1; min-width: 0; }
+.status-titulo { font-size: 13.5px; font-weight: 600; }
+.status-detalhe { font-size: 12px; color: var(--muted); margin-top: 1px; }
+.status-detalhe:empty { display: none; }
+.status-aviso {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.status-aviso .btn { flex-shrink: 0; }
+
+.escolha {
+  margin-top: 12px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.06);
+}
+.escolha-titulo { font-size: 13.5px; font-weight: 600; }
+.escolha-resumo { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.escolha-opcoes { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-top: 12px; }
+.escolha-opcao {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--hairline);
+  background: var(--elevated);
+  color: var(--ink);
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+.escolha-opcao:hover { border-color: var(--evolution); transform: translateY(-1px); }
+.escolha-opcao:disabled { opacity: 0.6; cursor: default; transform: none; }
+.escolha-opcao-titulo { font-size: 13px; font-weight: 600; }
+.escolha-opcao-texto { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+.escolha-rodape { font-size: 11.5px; color: var(--muted); margin-top: 10px; }
+.status-autostart {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+.login-aviso {
+  margin: -8px 0 18px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 12.5px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+/* ---------- Importação (mãos / torneios) ---------- */
 
 .import-buttons { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 14px; }
 .import-btn {

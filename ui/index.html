@@ -141,7 +141,7 @@
         </div>
       </div>
 
-      <div class="section-heading"><h2>Importação</h2></div>
+      <div class="section-heading"><h2>Situação</h2></div>
 
       <!-- Situação do Radar agora: conectado/sincronizando, sem internet,
            o que falta no site (escolher o que importar, plano) e quando
@@ -194,6 +194,19 @@
         </div>
       </div>
 
+      <!-- Suas salas: pra cada sala, se a pasta existe, quanto tem nela e o
+           que fazer quando não acha nada (o "Site Settings" do PokerTracker/
+           Holdem Manager). Montado por renderSalas em app.js a partir do
+           comando painel_salas. -->
+      <div class="section-heading">
+        <h2>Suas salas</h2>
+        <button type="button" id="btn-salas-atualizar" class="link-btn">Atualizar</button>
+      </div>
+      <div id="salas-grid" class="salas-grid">
+        <div class="sala-card sala-carregando">Procurando suas salas no computador…</div>
+      </div>
+
+      <div class="section-heading"><h2>Importar</h2></div>
       <div class="import-buttons">
         <button type="button" class="import-btn" id="btn-open-hands" data-kind="hands">
           <span class="import-btn-icon">
@@ -213,6 +226,36 @@
             <span class="import-btn-hint">Buy-in, colocação e premiação</span>
           </span>
         </button>
+        <button type="button" class="import-btn" id="btn-import-files">
+          <span class="import-btn-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          </span>
+          <span class="import-btn-text">
+            <span class="import-btn-title">Importar arquivos baixados</span>
+            <span class="import-btn-hint">Zip do PokerCraft (GGPoker) ou arquivos .txt</span>
+          </span>
+        </button>
+      </div>
+
+      <!-- Resultado do "Importar arquivos baixados" (importar_arquivos no
+           lado Rust): o que foi reconhecido, de que sala, e o que entrou. -->
+      <div id="arquivos-panel" class="import-panel hidden">
+        <div class="import-panel-header">
+          <h3>Importar arquivos baixados</h3>
+          <button type="button" id="btn-arquivos-panel-close" class="btn-icon" aria-label="Fechar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <p class="settings-row-hint">
+          No GGPoker, baixe as mãos e os resultados de torneio no PokerCraft e escolha o .zip aqui. Serve
+          também pra arquivos .txt de qualquer sala — o Radar reconhece sozinho de onde é cada um, e o que já
+          estiver no PokerSync não entra de novo.
+        </p>
+        <div id="arquivos-status" class="status-msg"></div>
+        <table id="arquivos-tabela" class="results-table hidden">
+          <thead><tr><th>Sala</th><th>Tipo</th><th>Resultado</th></tr></thead>
+          <tbody id="arquivos-corpo"></tbody>
+        </table>
       </div>
 
       <div id="import-panel" class="import-panel hidden">

@@ -100,6 +100,7 @@ async function entrouNaConta() {
   await refreshConfig();
   await refreshAutostart();
   await loadRooms();
+  carregarSalas();
   checkForUpdate();
 }
 
@@ -193,6 +194,7 @@ const AVISOS = {
   },
 };
 let avisoAtual = null;
+let ultimaVerificacaoVista = null;
 
 // ---------- Pergunta "o que importar" ----------
 // Pedido explícito: a escolha fica no Radar e no site (é a mesma). Aparece
@@ -275,6 +277,10 @@ function renderStatus(s) {
     tom = "neutro";
     titulo = "Sincronização automática desligada";
     detalhe = "Ligue em Configurações, ou use \"Sincronizar agora\".";
+  } else if (s.pastas_vigiadas > 0) {
+    // As pastas das salas estão sendo vigiadas: a mão vai pro PokerSync
+    // segundos depois de jogada (ver src-tauri/src/watcher.rs).
+    titulo = "Tudo certo — sincronizando em tempo real";
   } else {
     titulo = "Tudo certo — sincronizando sozinho";
   }
@@ -314,6 +320,12 @@ function renderStatus(s) {
   const perguntar = s.conexao === "ok" && s.radar_liberado !== false && !s.import_scope;
   el("escolha-importacao").classList.toggle("hidden", !perguntar);
   if (perguntar) carregarResumo();
+
+  // Depois de cada verificação (automática ou não), os números das salas mudam.
+  if (s.ultima_sincronizacao && s.ultima_sincronizacao !== ultimaVerificacaoVista) {
+    ultimaVerificacaoVista = s.ultima_sincronizacao;
+    carregarSalas();
+  }
 }
 
 listen("status-changed", (event) => renderStatus(event.payload));
@@ -340,6 +352,175 @@ el("btn-sync-agora").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
   }
+});
+
+// ---------- Suas salas ----------
+// Pra cada sala: se a pasta existe, quanto tem nela e o que fazer quando
+// não acha nada (painel_salas no lado Rust). Tudo que vem de lá entra por
+// textContent — caminho de pasta e nome de arquivo são dados, não HTML.
+
+const SITUACAO = {
+  ok: { texto: "Sincronizado", tom: "ok" },
+  pendente: { texto: "Enviando", tom: "info" },
+  aguardando_site: { texto: "Aguardando o site", tom: "alerta" },
+  pasta_vazia: { texto: "Pasta vazia", tom: "alerta" },
+  nao_encontrada: { texto: "Não encontrada", tom: "neutro" },
+};
+
+let salasCarregando = false;
+let salasDeNovo = false;
+
+async function carregarSalas() {
+  // Um pedido por vez; se pedirem de novo no meio, refaz uma vez no fim.
+  if (salasCarregando) {
+    salasDeNovo = true;
+    return;
+  }
+  salasCarregando = true;
+  try {
+    renderSalas(await invoke("painel_salas"));
+  } catch (err) {
+    const grid = el("salas-grid");
+    grid.innerHTML = "";
+    const card = document.createElement("div");
+    card.className = "sala-card sala-carregando";
+    card.textContent = `Não consegui olhar as pastas agora: ${err}`;
+    grid.appendChild(card);
+  } finally {
+    salasCarregando = false;
+    if (salasDeNovo) {
+      salasDeNovo = false;
+      carregarSalas();
+    }
+  }
+}
+
+// Corta o começo (o fim do caminho é o que diz qual pasta é); curto o
+// bastante pra caber no cartão sem o CSS cortar o fim também.
+function pastaCurta(pasta) {
+  return pasta.length > 40 ? "…" + pasta.slice(-38) : pasta;
+}
+
+function renderSalas(salas) {
+  const grid = el("salas-grid");
+  grid.innerHTML = "";
+  // Salas com alguma coisa primeiro; as não encontradas no fim, apagadas.
+  const ordem = (s) => (s.situacao === "nao_encontrada" ? 2 : s.situacao === "pasta_vazia" ? 1 : 0);
+  for (const sala of [...salas].sort((a, b) => ordem(a) - ordem(b))) {
+    const situacao = SITUACAO[sala.situacao] ?? SITUACAO.nao_encontrada;
+    const card = document.createElement("div");
+    card.className = "sala-card" + (sala.situacao === "nao_encontrada" ? " apagada" : "");
+
+    const topo = document.createElement("div");
+    topo.className = "sala-topo";
+    const nome = document.createElement("span");
+    nome.className = "sala-nome";
+    const ponto = document.createElement("span");
+    ponto.className = "room-dot";
+    ponto.style.background = ROOM_STYLE[sala.slug]?.accent ?? "var(--muted)";
+    nome.appendChild(ponto);
+    nome.appendChild(document.createTextNode(sala.nome));
+    const pill = document.createElement("span");
+    pill.className = "sala-pill";
+    pill.dataset.tom = situacao.tom;
+    pill.textContent = situacao.texto;
+    topo.appendChild(nome);
+    topo.appendChild(pill);
+    card.appendChild(topo);
+
+    if (sala.maos || sala.torneios) {
+      const numeros = document.createElement("div");
+      numeros.className = "sala-numeros";
+      const partes = [`${numero(sala.maos)} arquivo(s) de mãos`, `${numero(sala.torneios)} de torneios`];
+      const pendentes = sala.maos_pendentes + sala.torneios_pendentes;
+      if (pendentes && sala.situacao !== "aguardando_site") partes.push(`${numero(pendentes)} pra enviar`);
+      numeros.textContent = partes.join(" · ");
+      card.appendChild(numeros);
+    }
+
+    if (sala.pastas.length) {
+      const pasta = document.createElement("div");
+      pasta.className = "sala-pasta";
+      pasta.title = sala.pastas.join("\n");
+      pasta.textContent =
+        pastaCurta(sala.pastas[0]) + (sala.pastas.length > 1 ? ` (+${sala.pastas.length - 1})` : "");
+      card.appendChild(pasta);
+    }
+
+    if (sala.dica) {
+      const dica = document.createElement("div");
+      dica.className = "sala-dica";
+      dica.textContent = sala.dica;
+      card.appendChild(dica);
+    }
+    grid.appendChild(card);
+  }
+}
+
+el("btn-salas-atualizar").addEventListener("click", carregarSalas);
+
+// ---------- Importar arquivos baixados ----------
+// O "importar do disco" do PokerTracker/Holdem Manager: o jogador escolhe
+// o .zip baixado do PokerCraft (GGPoker) ou .txt soltos; o Radar reconhece
+// sala e tipo de cada arquivo e envia (importar_arquivos no lado Rust).
+
+const TIPO_ARQUIVO = { hands: "Mãos", tournaments: "Torneios" };
+
+function resultadoDaLinha(l) {
+  if (l.aguardando) return "Aguardando o site aprender a ler essa sala — nada enviado ainda";
+  const partes = [`${l.imported} nova(s)`, `${l.duplicates} repetida(s)`];
+  if (l.ignored_by_date) partes.push(`${l.ignored_by_date} de antes do corte`);
+  if (l.errors) partes.push(`${l.errors} c/ erro`);
+  if (l.recusados) partes.push(`${l.recusados} arquivo(s) recusado(s)`);
+  return partes.join(", ");
+}
+
+el("btn-import-files").addEventListener("click", async () => {
+  const escolhidos = await openFolderDialog({
+    multiple: true,
+    directory: false,
+    title: "Escolher arquivos baixados (.zip ou .txt)",
+    filters: [{ name: "Histórico de mãos", extensions: ["zip", "txt"] }],
+  });
+  if (!escolhidos || (Array.isArray(escolhidos) && escolhidos.length === 0)) return;
+  const caminhos = Array.isArray(escolhidos) ? escolhidos : [escolhidos];
+
+  el("arquivos-panel").classList.remove("hidden");
+  el("arquivos-tabela").classList.add("hidden");
+  const status = el("arquivos-status");
+  setStatus(status, `Lendo e enviando ${caminhos.length} arquivo(s)…`);
+  el("arquivos-panel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  try {
+    const r = await invoke("importar_arquivos", { caminhos });
+    const corpo = el("arquivos-corpo");
+    corpo.innerHTML = "";
+    for (const l of r.linhas) {
+      const tr = document.createElement("tr");
+      const sala = document.createElement("td");
+      sala.innerHTML = roomLabel(l.sala); // rótulo montado só com dados fixos (list_rooms/ROOM_STYLE)
+      const tipo = document.createElement("td");
+      tipo.textContent = TIPO_ARQUIVO[l.tipo] ?? l.tipo;
+      const resultado = document.createElement("td");
+      resultado.textContent = `${l.arquivos} arquivo(s): ${resultadoDaLinha(l)}`;
+      tr.append(sala, tipo, resultado);
+      corpo.appendChild(tr);
+    }
+    el("arquivos-tabela").classList.toggle("hidden", r.linhas.length === 0);
+    const novos = r.linhas.reduce((acc, l) => acc + l.imported, 0);
+    const ignorados = r.ignorados ? ` ${r.ignorados} arquivo(s) não eram de mão/torneio (ou estavam repetidos) e ficaram de fora.` : "";
+    if (r.linhas.length === 0) {
+      setStatus(status, `Nenhum arquivo de mão ou torneio reconhecido nos ${r.arquivos_lidos} lido(s).`, "err");
+    } else {
+      setStatus(status, `Importação concluída — ${novos} novo(s).${ignorados}`, "ok");
+    }
+    carregarSalas();
+  } catch (err) {
+    setStatus(status, String(err), "err");
+  }
+});
+
+el("btn-arquivos-panel-close").addEventListener("click", () => {
+  el("arquivos-panel").classList.add("hidden");
 });
 
 // ---------- Auto-update ----------
@@ -502,6 +683,7 @@ function renderImportFolders() {
 
 async function saveImportFolders() {
   await invoke("save_extra_folders", { kind: openImportKind, folders: extraFolders[openImportKind] ?? [] });
+  carregarSalas();
 }
 
 el("btn-import-add-folder").addEventListener("click", async () => {
@@ -586,6 +768,7 @@ el("btn-import-scan").addEventListener("click", async () => {
     );
     const total = summaries.reduce((acc, s) => acc + s.imported, 0);
     setStatus(status, `Verificação concluída — ${total} novo(s).`, "ok");
+    carregarSalas();
   } catch (err) {
     setStatus(status, String(err), "err");
   }
@@ -600,6 +783,7 @@ async function boot() {
   if (cfg.logged_in) {
     await refreshAutostart();
     await loadRooms();
+    carregarSalas(); // não bloqueia o boot
     checkForUpdate(); // não bloqueia o boot -- só avisa quando terminar
   }
 }

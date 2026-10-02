@@ -44,3 +44,12 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 rand = "0.8"
 url = "2"
 base64 = "0.22"
+# Vigia as pastas de hand history em tempo real (igual ao "auto-import" do
+# PokerTracker/Holdem Manager) — a mão nova vai pro PokerSync segundos
+# depois de jogada, em vez de esperar o ciclo de 5 minutos.
+notify = "8"
+# Lê o .zip baixado do PokerCraft (GGPoker) no "Importar arquivos baixados".
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

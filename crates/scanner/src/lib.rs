@@ -35,7 +35,9 @@ pub struct PendingFile {
     pub signature: FileSignature,
 }
 
-fn has_text_extension(path: &Path) -> bool {
+/// Arquivo com extensão de hand history (.txt/.log) — os únicos que a
+/// varredura e a vigilância das pastas olham.
+pub fn has_text_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("txt") || e.eq_ignore_ascii_case("log"))

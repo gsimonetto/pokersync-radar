@@ -1,6 +1,8 @@
 mod auth;
 mod config;
+mod importar;
 mod keychain;
+mod watcher;
 
 use config::AppConfig;
 use scanner::text::{fingerprint, new_part_since, split_into_parts};
@@ -70,6 +72,9 @@ struct RadarStatus {
     /// Arquivos que o site recusou e o Radar deixou de lado (tenta de novo
     /// em um dia, ou quando o arquivo mudar) — o resto segue sendo enviado.
     arquivos_recusados: u32,
+    /// Pastas vigiadas em tempo real (ver watcher.rs). Zero = só o ciclo
+    /// de 5 minutos (nenhuma pasta de sala existe ainda neste computador).
+    pastas_vigiadas: u32,
 }
 
 impl RadarStatus {
@@ -90,6 +95,7 @@ impl RadarStatus {
             ultimas_novidades_em: None,
             ultimo_erro: None,
             arquivos_recusados: 0,
+            pastas_vigiadas: 0,
         }
     }
 }
@@ -112,6 +118,10 @@ struct AppState {
     /// podem pedir ao mesmo tempo, e os dois gravam a memória de
     /// reconhecimento — ver `discover_all`).
     discover_lock: Mutex<()>,
+    /// Vigilância das pastas em tempo real e o canal por onde ela avisa
+    /// (ver `spawn_vigia`).
+    vigia: Mutex<watcher::Vigia>,
+    aviso_vigia: tokio::sync::mpsc::UnboundedSender<()>,
     status: Mutex<RadarStatus>,
     /// Acorda o ciclo automático na hora (depois de um login, por exemplo)
     /// em vez de esperar os 5 minutos.
@@ -133,6 +143,7 @@ fn texto_bandeja(s: &RadarStatus) -> String {
         _ if s.radar_liberado == Some(false) => "seu plano não inclui o Radar",
         _ if s.import_scope.is_none() => "falta escolher no site o que importar",
         _ if s.sincronizando => "sincronizando…",
+        _ if s.pastas_vigiadas > 0 => "sincronizando em tempo real",
         _ => "sincronizando sozinho",
     };
     format!("Radar PokerSync — {detalhe}")
@@ -370,13 +381,19 @@ fn save_device_name(state: State<AppState>, device_name: String) -> Result<(), S
 
 #[tauri::command]
 fn save_extra_folders(
+    app: AppHandle,
     state: State<AppState>,
     kind: String,
     folders: Vec<String>,
 ) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    cfg.extra_folders.insert(kind, folders);
-    cfg.save(&state.config_path).map_err(|e| e.to_string())
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.extra_folders.insert(kind, folders);
+        cfg.save(&state.config_path).map_err(|e| e.to_string())?;
+    }
+    // Pasta nova já passa a ser vigiada na hora.
+    atualizar_vigia(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -609,14 +626,9 @@ fn state_file_name(room: PokerRoom, kind: FileKind) -> String {
     format!("{}-{}.json", room.slug(), kind.slug())
 }
 
-/// Arquivos desse tipo em TODAS as salas de uma vez, separados por sala —
-/// nas pastas padrão de cada sala e nas pastas extras que o jogador
-/// escolheu (ver `scanner::discover`: cada pasta é percorrida uma vez e
-/// cada arquivo fica com uma sala só). A memória de reconhecimento fica ao
-/// lado do progresso de envio e evita reabrir, a cada 5 minutos, arquivos
-/// que não mudaram.
-fn discover_all(state: &AppState, kind: FileKind) -> Vec<(PokerRoom, Vec<DiscoveredFile>)> {
-    let extra: Vec<PathBuf> = state
+/// Pastas que o jogador adicionou pra esse tipo de arquivo.
+fn pastas_extras(state: &AppState, kind: FileKind) -> Vec<PathBuf> {
+    state
         .config
         .lock()
         .unwrap()
@@ -626,7 +638,52 @@ fn discover_all(state: &AppState, kind: FileKind) -> Vec<(PokerRoom, Vec<Discove
         .unwrap_or_default()
         .into_iter()
         .map(PathBuf::from)
+        .collect()
+}
+
+/// Passa a vigiar as pastas de hoje (padrão de cada sala que existem no
+/// disco + as adicionadas) — chamado ao abrir, ao mudar as pastas e a cada
+/// ciclo (uma sala instalada depois começa a ser vigiada sozinha).
+fn atualizar_vigia(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let candidatas: Vec<PathBuf> = [FileKind::HandHistory, FileKind::TournamentSummary]
+        .into_iter()
+        .flat_map(|kind| search_roots(kind, &pastas_extras(&state, kind)))
+        .map(|r| r.path)
         .collect();
+    let pastas = watcher::pastas_para_vigiar(candidatas);
+    let vigiadas = state.vigia.lock().unwrap().atualizar(pastas, &state.aviso_vigia) as u32;
+    if state.status.lock().unwrap().pastas_vigiadas != vigiadas {
+        atualizar_status(app, |s| s.pastas_vigiadas = vigiadas);
+    }
+}
+
+/// Recebe os avisos da vigilância e, `watcher::ESPERA_APOS_MUDANCA` depois
+/// do primeiro, acorda o ciclo automático (juntando os avisos que chegaram
+/// nesse meio-tempo num envio só). Com a sincronização automática
+/// desligada ou fora da conta, os avisos são ignorados.
+fn spawn_vigia(app: AppHandle, mut avisos: tokio::sync::mpsc::UnboundedReceiver<()>) {
+    tauri::async_runtime::spawn(async move {
+        while avisos.recv().await.is_some() {
+            tokio::time::sleep(watcher::ESPERA_APOS_MUDANCA).await;
+            while avisos.try_recv().is_ok() {}
+            let state = app.state::<AppState>();
+            let ligado = state.config.lock().unwrap().auto_sync_enabled;
+            if ligado && state.logado.load(Ordering::SeqCst) {
+                state.wake.notify_one();
+            }
+        }
+    });
+}
+
+/// Arquivos desse tipo em TODAS as salas de uma vez, separados por sala —
+/// nas pastas padrão de cada sala e nas pastas extras que o jogador
+/// escolheu (ver `scanner::discover`: cada pasta é percorrida uma vez e
+/// cada arquivo fica com uma sala só). A memória de reconhecimento fica ao
+/// lado do progresso de envio e evita reabrir, a cada 5 minutos, arquivos
+/// que não mudaram.
+fn discover_all(state: &AppState, kind: FileKind) -> Vec<(PokerRoom, Vec<DiscoveredFile>)> {
+    let extra = pastas_extras(state, kind);
 
     let found = {
         let _uma_por_vez = state.discover_lock.lock().unwrap();
@@ -869,17 +926,17 @@ impl Envio<'_> {
     /// site o recusa pelo conteúdo, ou depois de algumas recusas seguidas.
     /// Antes, um arquivo recusado travava tudo: o mesmo lote ia de novo a
     /// cada ciclo, pra sempre, e nada depois dele chegava ao site.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `ao_recusar(dono, por_conteudo, falha)` decide o que fazer com o
+    /// arquivo culpado: `true` = fica de lado e o resto segue, `false` =
+    /// para o envio (tenta no próximo ciclo).
     async fn mandar_lote(
         &mut self,
         room: &str,
         files: Vec<SyncFile>,
         donos: Vec<usize>,
-        pendentes: &[DiscoveredFile],
-        sync_state: &mut SyncState,
-        state_path: &Path,
         resumo: &mut SyncSummary,
-        recusados: &mut HashSet<PathBuf>,
+        ao_recusar: &mut (dyn FnMut(usize, bool, &Falha) -> bool + Send),
     ) -> Result<(), Falha> {
         let mut isolamento = Isolamento::new(files, donos);
         while let Some((files, donos)) = isolamento.proximo() {
@@ -893,13 +950,28 @@ impl Envio<'_> {
             let Some(dono) = isolamento.recusado(files, donos) else {
                 continue;
             };
-            let arquivo = &pendentes[dono];
-            let desistiu =
-                sync_state.record_failure(arquivo.path.clone(), arquivo.signature, por_conteudo, now_unix());
-            salvar_progresso(sync_state, state_path);
-            if !desistiu {
+            if !ao_recusar(dono, por_conteudo, &falha) {
                 return Err(falha);
             }
+        }
+        Ok(())
+    }
+}
+
+/// O que fazer com um arquivo do computador que o site recusou: conta a
+/// recusa no progresso da sala (`SyncState::record_failure`) e, se for pra
+/// deixar de lado, anota em `recusados` pra ele não ser marcado como enviado.
+fn recusa_no_computador<'a>(
+    pendentes: &'a [DiscoveredFile],
+    sync_state: &'a mut SyncState,
+    state_path: &'a Path,
+    recusados: &'a mut HashSet<PathBuf>,
+) -> impl FnMut(usize, bool, &Falha) -> bool + Send + 'a {
+    move |dono, por_conteudo, falha| {
+        let arquivo = &pendentes[dono];
+        let desistiu = sync_state.record_failure(arquivo.path.clone(), arquivo.signature, por_conteudo, now_unix());
+        salvar_progresso(sync_state, state_path);
+        if desistiu {
             eprintln!(
                 "[radar] o PokerSync recusou {} ({}) — deixado de lado, o resto segue",
                 arquivo.path.display(),
@@ -907,7 +979,7 @@ impl Envio<'_> {
             );
             recusados.insert(arquivo.path.clone());
         }
-        Ok(())
+        desistiu
     }
 }
 
@@ -964,18 +1036,12 @@ async fn sincronizar_tipo(app: &AppHandle, kind: FileKind, device: &DeviceInfo) 
                 if lote.is_full_for(parte.len()) {
                     let itens = lote.take();
                     let itens_donos = std::mem::take(&mut donos);
-                    envio
-                        .mandar_lote(
-                            room.slug(),
-                            itens,
-                            itens_donos,
-                            &pendentes,
-                            &mut sync_state,
-                            &state_path,
-                            &mut resumo,
-                            &mut recusados,
-                        )
-                        .await?;
+                    {
+                        let mut ao_recusar = recusa_no_computador(&pendentes, &mut sync_state, &state_path, &mut recusados);
+                        envio
+                            .mandar_lote(room.slug(), itens, itens_donos, &mut resumo, &mut ao_recusar)
+                            .await?;
+                    }
                     resumo.files_synced += marcar_enviados(&mut sync_state, &state_path, &mut concluidos, &recusados);
                 }
                 lote.push(SyncFile {
@@ -996,18 +1062,11 @@ async fn sincronizar_tipo(app: &AppHandle, kind: FileKind, device: &DeviceInfo) 
         if !lote.is_empty() {
             let itens = lote.take();
             let itens_donos = std::mem::take(&mut donos);
+            let mut ao_recusar = recusa_no_computador(&pendentes, &mut sync_state, &state_path, &mut recusados);
             envio
-                .mandar_lote(
-                    room.slug(),
-                    itens,
-                    itens_donos,
-                    &pendentes,
-                    &mut sync_state,
-                    &state_path,
-                    &mut resumo,
-                    &mut recusados,
-                )
+                .mandar_lote(room.slug(), itens, itens_donos, &mut resumo, &mut ao_recusar)
                 .await?;
+            drop(ao_recusar);
         }
         resumo.files_synced += marcar_enviados(&mut sync_state, &state_path, &mut concluidos, &recusados);
         resumo.files_rejected = sync_state.given_up_count() as u32;
@@ -1088,6 +1147,7 @@ async fn ciclo(app: &AppHandle, enviar: bool) -> Ciclo {
     atualizar_status(app, |s| s.sincronizando = true);
     let resultado = ciclo_interno(app, enviar).await;
     atualizar_status(app, |s| s.sincronizando = false);
+    atualizar_vigia(app);
     resultado
 }
 
@@ -1231,6 +1291,297 @@ async fn resumo_do_computador(app: AppHandle) -> Result<ResumoComputador, String
     tauri::async_runtime::spawn_blocking(move || resumir_computador(&app.state::<AppState>()))
         .await
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Painel "Suas salas" — o "Site Settings" do PokerTracker/Holdem Manager:
+// pra cada sala, se a pasta existe, quanto tem nela e o que fazer quando
+// não acha nada.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, Clone, Debug, Default)]
+struct PainelSala {
+    slug: String,
+    nome: String,
+    /// Pastas onde o Radar procura essa sala e que existem no disco (as
+    /// padrão dela, mais as adicionadas onde apareceram arquivos dela).
+    pastas: Vec<String>,
+    maos: u32,
+    maos_pendentes: u32,
+    torneios: u32,
+    torneios_pendentes: u32,
+    recusados: u32,
+    /// "ok" | "pendente" | "aguardando_site" | "pasta_vazia" | "nao_encontrada"
+    situacao: &'static str,
+    dica: Option<String>,
+}
+
+fn situacao_da_sala(room: PokerRoom, p: &PainelSala) -> &'static str {
+    if p.maos + p.torneios > 0 {
+        if !envio_liberado(room) {
+            "aguardando_site"
+        } else if p.maos_pendentes + p.torneios_pendentes > 0 {
+            "pendente"
+        } else {
+            "ok"
+        }
+    } else if !p.pastas.is_empty() {
+        "pasta_vazia"
+    } else {
+        "nao_encontrada"
+    }
+}
+
+/// O que dizer pro jogador sobre a sala — sempre uma ação que ele pode
+/// fazer, nunca só "não achei".
+fn dica_da_sala(room: PokerRoom, p: &PainelSala) -> Option<String> {
+    let nome = room.display_name();
+    if room == PokerRoom::GgPoker && p.maos == 0 {
+        return Some(
+            "O GGPoker costuma deixar o histórico no PokerCraft, e não no computador: baixe lá suas mãos e \
+             torneios e use \"Importar arquivos baixados\"."
+                .to_string(),
+        );
+    }
+    match p.situacao {
+        "nao_encontrada" => Some(format!(
+            "Não achei a pasta do {nome} neste computador. Se você joga lá, ative no cliente a opção de \
+             salvar o histórico de mãos, ou adicione a pasta em \"Importar mãos\"."
+        )),
+        "pasta_vazia" => Some(format!(
+            "Achei a pasta do {nome}, mas nenhuma mão nela. Confira se o cliente está salvando o histórico de mãos."
+        )),
+        "aguardando_site" => Some(format!(
+            "O envio do {nome} começa assim que o PokerSync aprender a ler essa sala — nada se perde até lá."
+        )),
+        _ if p.recusados > 0 => Some(format!(
+            "{} arquivo(s) recusado(s) pelo PokerSync — o Radar tenta de novo em um dia.",
+            p.recusados
+        )),
+        _ if room == PokerRoom::GgPoker && p.torneios == 0 => Some(
+            "Os resultados de torneio do GGPoker ficam no PokerCraft: baixe lá e use \"Importar arquivos baixados\"."
+                .to_string(),
+        ),
+        _ if room == PokerRoom::PokerStars && p.torneios == 0 => Some(
+            "Joga torneios? No cliente do PokerStars, ative também a opção de salvar os resumos de torneio — \
+             é de lá que vem a premiação."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn montar_painel(state: &AppState) -> Vec<PainelSala> {
+    let mut painel: Vec<(PokerRoom, PainelSala, Vec<PathBuf>)> = PokerRoom::ALL
+        .into_iter()
+        .map(|room| {
+            let p = PainelSala {
+                slug: room.slug().to_string(),
+                nome: room.display_name().to_string(),
+                ..Default::default()
+            };
+            (room, p, Vec::new())
+        })
+        .collect();
+
+    for kind in [FileKind::HandHistory, FileKind::TournamentSummary] {
+        let roots = search_roots(kind, &pastas_extras(state, kind));
+        for (room, arquivos) in discover_all(state, kind) {
+            let Some((_, p, pastas)) = painel.iter_mut().find(|(r, _, _)| *r == room) else {
+                continue;
+            };
+            let sync_state = SyncState::load(&state.state_dir.join(state_file_name(room, kind)));
+            let pendentes = pending_files(&arquivos, &sync_state).len() as u32;
+            p.recusados += sync_state.given_up_count() as u32;
+            match kind {
+                FileKind::HandHistory => (p.maos, p.maos_pendentes) = (arquivos.len() as u32, pendentes),
+                FileKind::TournamentSummary => (p.torneios, p.torneios_pendentes) = (arquivos.len() as u32, pendentes),
+            }
+            // Pastas padrão da sala que existem, mesmo vazias (cliente
+            // instalado sem salvar histórico), e as adicionadas onde
+            // apareceram arquivos dela.
+            pastas.extend(
+                roots
+                    .iter()
+                    .filter(|r| r.hint == Some(room) && r.path.is_dir())
+                    .map(|r| r.path.clone()),
+            );
+            for f in &arquivos {
+                if let Some(r) = roots.iter().find(|r| f.path.starts_with(&r.path)) {
+                    pastas.push(r.path.clone());
+                }
+            }
+        }
+    }
+
+    painel
+        .into_iter()
+        .map(|(room, mut p, mut pastas)| {
+            pastas.sort();
+            pastas.dedup();
+            p.pastas = pastas.into_iter().map(|c| c.display().to_string()).collect();
+            p.situacao = situacao_da_sala(room, &p);
+            p.dica = dica_da_sala(room, &p);
+            p
+        })
+        .collect()
+}
+
+/// Situação de cada sala no computador (usa a memória de reconhecimento —
+/// rápido mesmo com anos de histórico).
+#[tauri::command]
+async fn painel_salas(app: AppHandle) -> Result<Vec<PainelSala>, String> {
+    tauri::async_runtime::spawn_blocking(move || montar_painel(&app.state::<AppState>()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// "Importar arquivos baixados" (zip do PokerCraft ou .txt soltos)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct LinhaImportacao {
+    tipo: &'static str,
+    sala: String,
+    arquivos: u32,
+    imported: u32,
+    duplicates: u32,
+    errors: u32,
+    ignored_by_date: u32,
+    recusados: u32,
+    /// Sala que o site ainda não sabe ler (ver `envio_liberado`): nada enviado.
+    aguardando: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ResultadoImportacao {
+    arquivos_lidos: u32,
+    ignorados: u32,
+    linhas: Vec<LinhaImportacao>,
+}
+
+/// Lê os arquivos escolhidos, reconhece sala e tipo de cada um e envia —
+/// mesmos lotes, limites e tratamento de recusa do envio automático. Não
+/// entra no progresso das pastas: o site descarta o que já tiver.
+#[tauri::command]
+async fn importar_arquivos(app: AppHandle, caminhos: Vec<String>) -> Result<ResultadoImportacao, String> {
+    let state = app.state::<AppState>();
+    let _um_por_vez = state.sync_lock.lock().await;
+    atualizar_status(&app, |s| s.sincronizando = true);
+    let resultado = importar_arquivos_interno(&app, caminhos).await;
+    atualizar_status(&app, |s| s.sincronizando = false);
+    resultado
+}
+
+async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<String>) -> Result<ResultadoImportacao, String> {
+    let caminhos: Vec<PathBuf> = caminhos.into_iter().map(PathBuf::from).collect();
+    let leitura = tauri::async_runtime::spawn_blocking(move || importar::ler_escolhidos(&caminhos))
+        .await
+        .map_err(|e| e.to_string())??;
+    let device = device_info(&app.state::<AppState>());
+    let mut linhas = Vec::new();
+
+    for grupo in leitura.grupos {
+        let mut linha = LinhaImportacao {
+            tipo: grupo.kind.slug(),
+            sala: grupo.room.slug().to_string(),
+            arquivos: grupo.textos.len() as u32,
+            imported: 0,
+            duplicates: 0,
+            errors: 0,
+            ignored_by_date: 0,
+            recusados: 0,
+            aguardando: false,
+        };
+        if !envio_liberado(grupo.room) {
+            linha.aguardando = true;
+            linhas.push(linha);
+            continue;
+        }
+        let chave = match chave_de_acesso(app, None).await {
+            Ok(c) => c,
+            Err(e) => return Err(e.mensagem()),
+        };
+        let mut envio = Envio {
+            app,
+            device: &device,
+            kind: grupo.kind,
+            client: SyncClient::new(config::site_url(), chave.clone()),
+            chave,
+            renovou: false,
+        };
+        let mut resumo = SyncSummary::default();
+        let mut recusados: HashSet<usize> = HashSet::new();
+        let mut lote = BatchBuilder::new(MAX_FILES_PER_BATCH, MAX_BATCH_BYTES);
+        let mut donos: Vec<usize> = Vec::new();
+        let enviado = async {
+            for (indice, texto) in grupo.textos.iter().enumerate() {
+                let partes: Vec<&str> = match grupo.kind {
+                    FileKind::HandHistory => split_into_parts(texto, MAX_HAND_PART_BYTES),
+                    FileKind::TournamentSummary if texto.len() > MAX_SUMMARY_BYTES => {
+                        recusados.insert(indice);
+                        Vec::new()
+                    }
+                    FileKind::TournamentSummary => vec![texto.as_str()],
+                };
+                for parte in partes.into_iter().filter(|p| !p.trim().is_empty()) {
+                    if lote.is_full_for(parte.len()) {
+                        let (itens, itens_donos) = (lote.take(), std::mem::take(&mut donos));
+                        let mut ao_recusar = |dono: usize, _: bool, _: &Falha| {
+                            recusados.insert(dono);
+                            true
+                        };
+                        envio
+                            .mandar_lote(grupo.room.slug(), itens, itens_donos, &mut resumo, &mut ao_recusar)
+                            .await?;
+                    }
+                    lote.push(SyncFile {
+                        raw_text: parte.to_string(),
+                        captured_at: None,
+                    });
+                    donos.push(indice);
+                }
+            }
+            if !lote.is_empty() {
+                let (itens, itens_donos) = (lote.take(), std::mem::take(&mut donos));
+                let mut ao_recusar = |dono: usize, _: bool, _: &Falha| {
+                    recusados.insert(dono);
+                    true
+                };
+                envio
+                    .mandar_lote(grupo.room.slug(), itens, itens_donos, &mut resumo, &mut ao_recusar)
+                    .await?;
+            }
+            Ok::<(), Falha>(())
+        }
+        .await;
+        if let Err(f) = enviado {
+            let mensagem = f.mensagem();
+            registrar_falha(app, f);
+            return Err(mensagem);
+        }
+        linha.imported = resumo.imported;
+        linha.duplicates = resumo.duplicates;
+        linha.errors = resumo.errors;
+        linha.ignored_by_date = resumo.ignored_by_date;
+        linha.recusados = recusados.len() as u32;
+        linhas.push(linha);
+    }
+
+    let novidades: u32 = linhas.iter().map(|l| l.imported).sum();
+    if novidades > 0 {
+        let quando = agora();
+        atualizar_status(app, |s| {
+            s.ultimas_novidades = Some(novidades);
+            s.ultimas_novidades_em = Some(quando);
+        });
+    }
+    Ok(ResultadoImportacao {
+        arquivos_lidos: leitura.arquivos_lidos,
+        ignorados: leitura.ignorados,
+        linhas,
+    })
 }
 
 /// O jogador escolheu, no próprio Radar, o que importar — salva no site
@@ -1381,6 +1732,7 @@ pub fn run() {
 
             let status = RadarStatus::inicial(logado, config.sessao_expirada);
             let dica = texto_bandeja(&status);
+            let (aviso_vigia, avisos) = tokio::sync::mpsc::unbounded_channel();
             app.manage(AppState {
                 config_path,
                 state_dir,
@@ -1393,6 +1745,8 @@ pub fn run() {
                 logado: AtomicBool::new(logado),
                 sync_lock: tokio::sync::Mutex::new(()),
                 discover_lock: Mutex::new(()),
+                vigia: Mutex::new(watcher::Vigia::default()),
+                aviso_vigia,
                 status: Mutex::new(status),
                 wake: tokio::sync::Notify::new(),
             });
@@ -1400,6 +1754,8 @@ pub fn run() {
             // Confere o login, manda o sinal de vida e sincroniza logo ao
             // abrir; depois, a cada 5 minutos.
             spawn_ciclo_automatico(app.handle().clone());
+            spawn_vigia(app.handle().clone(), avisos);
+            atualizar_vigia(app.handle());
 
             // Login com Google: radar-pokersync://auth?code=...&state=...
             // volta aqui depois do navegador do sistema completar o OAuth
@@ -1495,6 +1851,8 @@ pub fn run() {
             sync_now,
             sincronizar_agora,
             resumo_do_computador,
+            painel_salas,
+            importar_arquivos,
             escolher_importacao,
             get_autostart,
             set_autostart,
@@ -1603,6 +1961,48 @@ mod tests {
         assert_eq!(culpados, vec![2]);
         assert_eq!(aceitos, vec!["a", "b", "c1", "c3", "d", "e"]); // na ordem
         assert!(envios <= 7, "{envios} envios");
+    }
+
+    fn painel(maos: u32, torneios: u32, pastas: usize, pendentes: u32) -> PainelSala {
+        PainelSala {
+            maos,
+            torneios,
+            maos_pendentes: pendentes,
+            pastas: vec!["C:/x".to_string(); pastas],
+            ..Default::default()
+        }
+    }
+
+    fn com_situacao(room: PokerRoom, mut p: PainelSala) -> PainelSala {
+        p.situacao = situacao_da_sala(room, &p);
+        p.dica = dica_da_sala(room, &p);
+        p
+    }
+
+    #[test]
+    fn room_panel_says_what_to_do() {
+        let ps = com_situacao(PokerRoom::PokerStars, painel(100, 5, 1, 0));
+        assert_eq!((ps.situacao, ps.dica.is_none()), ("ok", true));
+
+        let ps_sem_resumo = com_situacao(PokerRoom::PokerStars, painel(100, 0, 1, 0));
+        assert!(ps_sem_resumo.dica.unwrap().contains("resumos de torneio"));
+
+        let pendente = com_situacao(PokerRoom::PokerStars, painel(100, 5, 1, 3));
+        assert_eq!(pendente.situacao, "pendente");
+
+        let vazia = com_situacao(PokerRoom::PartyPoker, painel(0, 0, 1, 0));
+        assert_eq!(vazia.situacao, "pasta_vazia");
+        assert!(vazia.dica.unwrap().contains("salvando o histórico"));
+
+        let sumida = com_situacao(PokerRoom::Poker888, painel(0, 0, 0, 0));
+        assert_eq!(sumida.situacao, "nao_encontrada");
+
+        let gg = com_situacao(PokerRoom::GgPoker, painel(0, 0, 0, 0));
+        assert!(gg.dica.unwrap().contains("PokerCraft"));
+
+        let acr = com_situacao(PokerRoom::Acr, painel(40, 0, 1, 40));
+        assert_eq!(acr.situacao, "aguardando_site");
+        assert!(acr.dica.unwrap().contains("aprender a ler"));
     }
 
     #[test]

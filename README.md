@@ -95,8 +95,15 @@ Do lado do produto, em `gsimonetto/pokersync` (`app/`, `lib/`):
 
 ## Ciclo automático
 
-`spawn_ciclo_automatico` (em `src-tauri/src/lib.rs`) roda logo ao abrir e
-depois a cada 5 minutos: confere a sessão (renova se preciso), manda o
+Igual ao "auto-import" do PokerTracker/Holdem Manager, o Radar **vigia as
+pastas** das salas (`src-tauri/src/watcher.rs`, crate `notify`): quando o
+cliente grava uma mão, o ciclo roda uns 20 s depois (`ESPERA_APOS_MUDANCA`,
+juntando as mesas que gravaram nesse meio-tempo num envio só). A lista de
+pastas vigiadas é refeita ao abrir, ao mudar as pastas e a cada ciclo — sala
+instalada depois entra sozinha.
+
+`spawn_ciclo_automatico` (em `src-tauri/src/lib.rs`) roda logo ao abrir,
+quando a vigilância avisa e, como rede de segurança, a cada 5 minutos: confere a sessão (renova se preciso), manda o
 sinal de vida e, se estiver tudo liberado, envia mãos e torneios novos.
 Sem internet (ex.: logo depois de ligar o PC), tenta de novo em 20 s,
 40 s, 80 s… até o intervalo normal. Um envio por vez (`sync_lock`): o
@@ -104,6 +111,24 @@ automático e o "Sincronizar agora" nunca rodam juntos. A tela mostra a
 situação (`status-changed`): tudo certo, sem internet, falta escolher o
 que importar (a pergunta aparece ali mesmo, com os números do que o
 Radar achou no computador), plano sem Radar ou sessão vencida.
+
+## Suas salas e arquivos baixados
+
+- **Suas salas** (`painel_salas`): um cartão por sala com a pasta onde o
+  Radar procura, quantos arquivos de mãos/torneios achou, quantos faltam
+  enviar e uma dica do que fazer quando não acha nada (ativar "salvar
+  histórico" no cliente, salvar resumos de torneio no PokerStars, baixar do
+  PokerCraft no GGPoker). Mesma ideia do "Site Settings" do PokerTracker/
+  Holdem Manager.
+- **Importar arquivos baixados** (`importar_arquivos`, `src-tauri/src/importar.rs`):
+  o jogador escolhe o .zip baixado do PokerCraft (o GGPoker não grava
+  resultado de torneio no computador) ou .txt soltos. Cada arquivo é
+  reconhecido pelo conteúdo (`PokerRoom::classify`) e enviado com os mesmos
+  lotes e tratamento de recusa do envio automático; não entra no progresso
+  das pastas (o site descarta o que já tiver).
+- O "resumo parcial" de torneio sem arquivo de resumo (buy-in, campeão,
+  2º/3º lugar, mesa final) o site já monta a partir das mãos
+  (`applyTournamentSignals` em `lib/services/agent-sync-service.ts`).
 
 ## Autenticação
 
@@ -205,5 +230,5 @@ cada sala pra substituir.
   "app não verificado" ao instalar). O ícone (cartas do logo PokerSync) já
   é o definitivo: `src-tauri/icons/`, com versão simplificada pros
   tamanhos pequenos.
-- Avisar na hora em que o arquivo muda (hoje o ciclo automático confere a
-  cada 5 minutos).
+- Liberar o envio do ACR (`envio_liberado` em `src-tauri/src/lib.rs`)
+  quando `hand-parser.ts` passar a ler o formato da Winning Poker Network.

@@ -262,6 +262,7 @@ body::after {
 .value-item p { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.45; }
 
 .section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.section-heading .link-btn { display: inline; width: auto; margin: 0; }
 .section-heading h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 0; }
 
 /* ---------- Banner de atualização disponível ---------- */
@@ -396,6 +397,31 @@ body::after {
 .import-btn-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .import-btn-title { font-size: 14px; font-weight: 600; }
 .import-btn-hint { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+
+/* Suas salas — um cartão por sala (renderSalas em app.js). */
+.salas-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.sala-card {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 4px;
+  min-width: 0;
+}
+.sala-card.apagada { opacity: 0.6; }
+.sala-carregando { font-size: 12px; color: var(--muted); }
+.sala-topo { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sala-nome { display: inline-flex; align-items: center; font-size: 13.5px; font-weight: 600; }
+.sala-pill {
+  border-radius: 999px; padding: 2px 8px; font-size: 10.5px; font-weight: 600; white-space: nowrap;
+  background: var(--elevated); color: var(--muted);
+}
+.sala-pill[data-tom="ok"] { color: var(--positive); background: rgba(34, 197, 94, 0.12); }
+.sala-pill[data-tom="info"] { color: var(--training); background: rgba(59, 130, 246, 0.12); }
+.sala-pill[data-tom="alerta"] { color: var(--evolution); background: rgba(245, 158, 11, 0.12); }
+.sala-numeros { font-size: 12px; }
+.sala-pasta { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sala-dica { font-size: 11.5px; color: var(--muted); line-height: 1.4; margin-top: 2px; }
 
 .import-panel {
   background: var(--surface);

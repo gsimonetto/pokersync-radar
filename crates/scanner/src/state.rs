@@ -24,6 +24,23 @@ pub struct SentText {
     pub fingerprint: u64,
 }
 
+/// Quantas vezes seguidas o site pode recusar um arquivo (enviado sozinho)
+/// com erro do servidor antes de o Radar deixá-lo de lado e seguir com os
+/// outros. Recusa por conteúdo (erro 4xx) deixa de lado na primeira.
+pub const MAX_FAILED_ATTEMPTS: u32 = 3;
+/// Arquivo deixado de lado é tentado de novo depois disso (ou na hora, se
+/// mudar) — o problema pode ter sido do servidor, e já ter sido corrigido.
+pub const RETRY_GIVEN_UP_AFTER_SECS: i64 = 24 * 60 * 60;
+
+/// Arquivo que o site recusou mesmo enviado sozinho.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedFile {
+    pub signature: FileSignature,
+    pub attempts: u32,
+    /// Quando o Radar desistiu de enviar (segundos desde 1970).
+    pub given_up_at: Option<i64>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SyncState {
     synced_files: HashMap<PathBuf, FileSignature>,
@@ -31,6 +48,18 @@ pub struct SyncState {
     /// próximo envio de um arquivo que cresceu vai inteiro, como antes.
     #[serde(default)]
     sent_text: HashMap<PathBuf, SentText>,
+    /// Arquivos que o site recusou. Antes, um arquivo recusado sempre
+    /// travava o envio ali: o Radar tentava o mesmo lote pra sempre e nada
+    /// depois dele (nem as outras salas) chegava ao site.
+    #[serde(default)]
+    failed: HashMap<PathBuf, FailedFile>,
+}
+
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl SyncState {
@@ -58,18 +87,65 @@ impl SyncState {
     /// Um arquivo precisa ser (re)sincronizado se nunca foi visto antes, ou
     /// se mudou de tamanho/mtime desde o último sync (ex.: novas mãos
     /// anexadas no fim do arquivo do dia).
+    /// Arquivo deixado de lado (ver `record_failure`) não conta enquanto
+    /// não mudar e não passar `RETRY_GIVEN_UP_AFTER_SECS`.
     pub fn needs_sync(&self, path: &Path, sig: FileSignature) -> bool {
-        self.synced_files.get(path) != Some(&sig)
+        self.needs_sync_at(path, sig, now_unix())
+    }
+
+    pub fn needs_sync_at(&self, path: &Path, sig: FileSignature, now: i64) -> bool {
+        if self.synced_files.get(path) == Some(&sig) {
+            return false;
+        }
+        match self.failed.get(path) {
+            Some(f) if f.signature == sig => {
+                !matches!(f.given_up_at, Some(t) if now - t < RETRY_GIVEN_UP_AFTER_SECS)
+            }
+            _ => true,
+        }
     }
 
     pub fn mark_synced(&mut self, path: PathBuf, sig: FileSignature) {
+        self.failed.remove(&path);
         self.synced_files.insert(path, sig);
     }
 
     /// Igual a `mark_synced`, guardando também quanto do texto foi enviado.
     pub fn mark_synced_text(&mut self, path: PathBuf, sig: FileSignature, sent: SentText) {
+        self.failed.remove(&path);
         self.sent_text.insert(path.clone(), sent);
         self.synced_files.insert(path, sig);
+    }
+
+    /// O site recusou este arquivo, enviado sozinho. Conta a tentativa e
+    /// devolve `true` se o Radar deve deixá-lo de lado e seguir com os
+    /// outros: de cara quando `by_content` (recusa pelo conteúdo, que não
+    /// muda tentando de novo), ou na `MAX_FAILED_ATTEMPTS`-ésima recusa
+    /// seguida. Se o arquivo mudou desde a última recusa, a conta recomeça.
+    pub fn record_failure(&mut self, path: PathBuf, sig: FileSignature, by_content: bool, now: i64) -> bool {
+        let entry = self.failed.entry(path).or_insert(FailedFile {
+            signature: sig,
+            attempts: 0,
+            given_up_at: None,
+        });
+        if entry.signature != sig {
+            *entry = FailedFile {
+                signature: sig,
+                attempts: 0,
+                given_up_at: None,
+            };
+        }
+        entry.attempts += 1;
+        let give_up = by_content || entry.attempts >= MAX_FAILED_ATTEMPTS;
+        if give_up {
+            entry.given_up_at = Some(now);
+        }
+        give_up
+    }
+
+    /// Quantos arquivos o Radar deixou de lado (recusados pelo site).
+    pub fn given_up_count(&self) -> usize {
+        self.failed.values().filter(|f| f.given_up_at.is_some()).count()
     }
 
     pub fn sent_text(&self, path: &Path) -> Option<SentText> {
@@ -154,5 +230,40 @@ mod tests {
         let reloaded = SyncState::load(&state_path);
         assert_eq!(reloaded.sent_text(Path::new("/x/HH.txt")), Some(sent));
         assert!(!reloaded.needs_sync(Path::new("/x/HH.txt"), sig));
+    }
+
+    #[test]
+    fn rejected_file_is_set_aside_then_retried() {
+        let path = PathBuf::from("/x/HH.txt");
+        let sig = FileSignature { size: 10, modified_unix: 1 };
+        let mut state = SyncState::default();
+        let now = 1_000_000;
+
+        // Erro do servidor: tenta de novo até MAX_FAILED_ATTEMPTS.
+        for _ in 1..MAX_FAILED_ATTEMPTS {
+            assert!(!state.record_failure(path.clone(), sig, false, now));
+            assert!(state.needs_sync_at(&path, sig, now));
+        }
+        assert!(state.record_failure(path.clone(), sig, false, now));
+        assert!(!state.needs_sync_at(&path, sig, now));
+        assert_eq!(state.given_up_count(), 1);
+
+        // Volta a tentar depois de um dia, ou se o arquivo mudar.
+        assert!(state.needs_sync_at(&path, sig, now + RETRY_GIVEN_UP_AFTER_SECS));
+        let grew = FileSignature { size: 20, modified_unix: 2 };
+        assert!(state.needs_sync_at(&path, grew, now));
+
+        // Enviado com sucesso: sai da lista de recusados.
+        state.mark_synced(path.clone(), grew);
+        assert_eq!(state.given_up_count(), 0);
+    }
+
+    #[test]
+    fn content_rejection_sets_aside_at_once() {
+        let path = PathBuf::from("/x/HH.txt");
+        let sig = FileSignature { size: 10, modified_unix: 1 };
+        let mut state = SyncState::default();
+        assert!(state.record_failure(path.clone(), sig, true, 5));
+        assert!(!state.needs_sync_at(&path, sig, 5));
     }
 }

@@ -87,6 +87,12 @@ pub fn is_hand_start(line: &str) -> bool {
     MARCADORES.iter().any(|m| l.starts_with(m))
 }
 
+/// O começo do arquivo já tem uma linha que abre mão — então é hand
+/// history, não resumo de torneio (ver `PokerRoom::classify`).
+pub fn looks_like_hand_history(head: &str) -> bool {
+    head.lines().any(is_hand_start)
+}
+
 /// Posições (em bytes) onde dá pra cortar o texto sem partir uma mão: o
 /// começo de cada linha que abre mão. Quando o formato não tem marcador
 /// conhecido, vale também o começo de uma linha logo depois de uma linha

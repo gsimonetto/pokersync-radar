@@ -49,15 +49,26 @@ Do lado do produto, em `gsimonetto/pokersync` (`app/`, `lib/`):
 
 ## Como funciona a varredura
 
-1. Pra cada sala selecionada, `PokerRoom::default_search_paths()` lista
-   pastas plausíveis por SO (Documents/AppData/Application Support, por
-   variação de skin conhecida). **Best-effort** — cada operadora muda isso
-   sem aviso. A UI permite adicionar pastas extras por sala.
-2. `discover_files` varre essas pastas recursivamente, filtra por extensão
-   e faz uma checagem rápida do início do arquivo (`PokerRoom::sniff`) —
-   confirmada contra hand history real só para PokerStars e GGPoker (mesmos
-   marcadores do parser). PartyPoker/888poker/ACR usam uma heurística mais
-   fraca hoje, documentada em `crates/scanner/src/room.rs`.
+1. `PokerRoom::default_search_paths()` lista, pra cada sala, pastas
+   plausíveis por SO (Documents/AppData/Application Support, por variação
+   de skin conhecida, e `C:\ACR Poker\handHistory` no Windows).
+   **Best-effort** — cada operadora muda isso sem aviso. A UI permite
+   adicionar pastas extras (por tipo: mãos ou torneios).
+2. `scanner::discover` percorre cada pasta uma vez só, filtra por extensão
+   e decide a sala de cada arquivo pelo começo dele
+   (`PokerRoom::classify`): primeiro a sala dona da pasta, depois as
+   demais. Arquivo que começa com uma mão nunca é tratado como resumo de
+   torneio. PokerStars e GGPoker são confirmados contra hand history real
+   (mesmos marcadores do parser); PartyPoker/888poker/ACR usam regras mais
+   fracas, documentadas em `crates/scanner/src/room.rs` (o ACR é
+   reconhecido pela linha "Hand #123 - ..." da Winning Poker Network, mas
+   só é enviado depois que o site aprender a ler esse formato — ver
+   `envio_liberado` em `src-tauri/src/lib.rs`). A
+   sala de cada arquivo fica guardada (`ClassCache`,
+   `sync-state/reconhecidos-*.json`): arquivo que não mudou não é aberto de
+   novo no ciclo seguinte. Ao mudar as regras de reconhecimento, suba
+   `CLASSIFIER_VERSION` em `crates/scanner/src/cache.rs` pra todo arquivo
+   ser reconhecido de novo.
 3. `SyncState` (um JSON por sala, em `app_config_dir()/sync-state/`) guarda
    tamanho+mtime de cada arquivo já sincronizado e quanto do texto já foi
    enviado — de um arquivo que cresceu (sessão rolando) só vai o trecho
@@ -69,7 +80,13 @@ Do lado do produto, em `gsimonetto/pokersync` (`app/`, `lib/`):
    começo de uma mão (`sync_client::BatchBuilder`,
    `scanner::text::split_into_parts`). O progresso é salvo a cada lote
    aceito. O backend separa as mãos (`splitHands`) e deduplica por
-   `external_hand_id`.
+   `external_hand_id`. Se o site recusa um lote por causa de algum arquivo
+   (erro 400/413/422, ou 500 ao processar), o Radar divide o lote ao meio
+   até achar o culpado, que fica de lado (`SyncState::record_failure`: de
+   cara na recusa pelo conteúdo, ou na 3ª recusa seguida) — o resto segue
+   sendo enviado, e o arquivo é tentado de novo em 24 h ou quando mudar. A
+   tela mostra quantos arquivos estão recusados. No limite de envios por
+   minuto (429), espera o tempo que o site pede e continua.
 5. O corte do que importar ("só de agora em diante", "últimos 3 meses" ou
    "tudo") é aplicado no site. Quando o jogador AMPLIA a escolha, o Radar
    esquece o que já tinha enviado e manda de novo (`lembrar_escopo` em

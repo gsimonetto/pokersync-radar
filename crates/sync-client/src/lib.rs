@@ -120,6 +120,9 @@ pub enum SyncError {
         status: u16,
         code: Option<String>,
         message: String,
+        /// Segundos que o servidor pediu pra esperar (cabeçalho
+        /// `Retry-After`, mandado junto com o 429 do limite de envios).
+        retry_after: Option<u64>,
     },
 }
 
@@ -140,6 +143,13 @@ impl SyncError {
     pub fn code(&self) -> Option<&str> {
         match self {
             SyncError::Rejected { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            SyncError::Rejected { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -284,6 +294,11 @@ impl SyncClient {
     /// body" em vez de uma mensagem que o jogador entende.
     async fn body_or_err(resp: reqwest::Response) -> Result<serde_json::Value, SyncError> {
         let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
         let bytes = resp.bytes().await?;
         let value: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
         if !status.is_success() {
@@ -306,6 +321,7 @@ impl SyncClient {
                 status: status.as_u16(),
                 code,
                 message,
+                retry_after,
             });
         }
         value.ok_or_else(|| SyncError::BadResponse("resposta sem JSON".to_string()))
@@ -534,6 +550,26 @@ mod tests {
 
         let client = SyncClient::new(server.uri(), "tok");
         client.set_import_scope("last_3_months").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_reports_how_long_to_wait() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/agent/sync"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "17")
+                    .set_body_json(serde_json::json!({"ok": false, "error": "Muitas tentativas"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = SyncClient::new(server.uri(), "tok");
+        let err = client.sync_batch(&device(), "acr", &[file("x")]).await.unwrap_err();
+        assert_eq!(err.status(), Some(429));
+        assert_eq!(err.retry_after(), Some(17));
+        assert!(err.is_transient());
     }
 
     #[test]

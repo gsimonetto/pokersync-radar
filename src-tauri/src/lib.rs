@@ -4,11 +4,12 @@ mod keychain;
 
 use config::AppConfig;
 use scanner::text::{fingerprint, new_part_since, split_into_parts};
+use scanner::state::now_unix;
 use scanner::{
-    discover_files, pending_files, read_text, DiscoveredFile, FileKind, FileSignature, PokerRoom, SentText,
-    SyncState,
+    discover, pending_files, read_text, search_roots, ClassCache, DiscoveredFile, FileKind, FileSignature,
+    PokerRoom, SentText, SyncState,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +37,9 @@ const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const RETRY_INICIAL: Duration = Duration::from_secs(20);
 /// Renova a chave de acesso quando faltar menos que isso pra ela vencer.
 const MARGEM_RENOVACAO_SEGS: i64 = 120;
+/// Quantas vezes, no mesmo envio, o Radar espera o tempo que o site pediu
+/// (limite de envios por minuto) antes de deixar pro próximo ciclo.
+const MAX_ESPERAS_LIMITE: u32 = 3;
 const TRAY_ID: &str = "radar";
 
 /// Sessão com o PokerSync. A chave de acesso (JWT, vence em ~1 hora) só
@@ -63,6 +67,9 @@ struct RadarStatus {
     ultimas_novidades: Option<u32>,
     ultimas_novidades_em: Option<u64>,
     ultimo_erro: Option<String>,
+    /// Arquivos que o site recusou e o Radar deixou de lado (tenta de novo
+    /// em um dia, ou quando o arquivo mudar) — o resto segue sendo enviado.
+    arquivos_recusados: u32,
 }
 
 impl RadarStatus {
@@ -82,6 +89,7 @@ impl RadarStatus {
             ultimas_novidades: None,
             ultimas_novidades_em: None,
             ultimo_erro: None,
+            arquivos_recusados: 0,
         }
     }
 }
@@ -100,6 +108,10 @@ struct AppState {
     /// Um envio por vez: o ciclo automático e o "Sincronizar agora" nunca
     /// rodam juntos (evita mandar o mesmo arquivo duas vezes).
     sync_lock: tokio::sync::Mutex<()>,
+    /// Uma varredura de disco por vez (o resumo da tela inicial e o envio
+    /// podem pedir ao mesmo tempo, e os dois gravam a memória de
+    /// reconhecimento — ver `discover_all`).
+    discover_lock: Mutex<()>,
     status: Mutex<RadarStatus>,
     /// Acorda o ciclo automático na hora (depois de um login, por exemplo)
     /// em vez de esperar os 5 minutos.
@@ -580,6 +592,16 @@ fn parse_kind(slug: &str) -> Result<FileKind, String> {
     FileKind::from_slug(slug).ok_or_else(|| format!("Tipo de import desconhecido: {slug}"))
 }
 
+/// Sala cujos arquivos o site já sabe ler. O ACR é reconhecido no
+/// computador (e entra nas contas da tela), mas ainda não é enviado: o
+/// site (`lib/poker/hand-parser.ts` em gsimonetto/pokersync) não separa as
+/// mãos desse formato e gravaria cada arquivo inteiro como uma "mão" só,
+/// marcada como enviada. Liberar aqui assim que o site aprender o formato
+/// — como nada foi marcado como enviado, o histórico inteiro vai na hora.
+fn envio_liberado(room: PokerRoom) -> bool {
+    room != PokerRoom::Acr
+}
+
 /// Nome do arquivo de estado por (sala, tipo) — mãos e torneios têm
 /// progresso de sync independente, mesmo quando compartilham a mesma
 /// sala/pasta.
@@ -587,13 +609,12 @@ fn state_file_name(room: PokerRoom, kind: FileKind) -> String {
     format!("{}-{}.json", room.slug(), kind.slug())
 }
 
-/// Pastas onde varrer esse tipo de arquivo, em TODAS as salas de uma vez —
-/// os caminhos padrão de cada sala pro tipo pedido, mais as pastas extras
-/// que o usuário escolheu manualmente (varridas contra todas as salas, o
-/// sniff decide de qual sala cada arquivo é). Cada arquivo fica com a
-/// primeira sala que o reconhece: antes, um arquivo numa pasta extra podia
-/// casar com duas salas (PartyPoker e 888 usam marcadores parecidos) e ir
-/// duas vezes, uma com cada nome de sala.
+/// Arquivos desse tipo em TODAS as salas de uma vez, separados por sala —
+/// nas pastas padrão de cada sala e nas pastas extras que o jogador
+/// escolheu (ver `scanner::discover`: cada pasta é percorrida uma vez e
+/// cada arquivo fica com uma sala só). A memória de reconhecimento fica ao
+/// lado do progresso de envio e evita reabrir, a cada 5 minutos, arquivos
+/// que não mudaram.
 fn discover_all(state: &AppState, kind: FileKind) -> Vec<(PokerRoom, Vec<DiscoveredFile>)> {
     let extra: Vec<PathBuf> = state
         .config
@@ -607,19 +628,25 @@ fn discover_all(state: &AppState, kind: FileKind) -> Vec<(PokerRoom, Vec<Discove
         .map(PathBuf::from)
         .collect();
 
-    let mut vistos: HashSet<PathBuf> = HashSet::new();
-    PokerRoom::ALL
-        .into_iter()
-        .map(|room| {
-            let mut roots = room.default_search_paths(kind);
-            roots.extend(extra.iter().cloned());
-            let files = discover_files(&roots, room, kind)
-                .into_iter()
-                .filter(|f| vistos.insert(f.path.clone()))
-                .collect();
-            (room, files)
-        })
-        .collect()
+    let found = {
+        let _uma_por_vez = state.discover_lock.lock().unwrap();
+        let cache_path = state.state_dir.join(format!("reconhecidos-{}.json", kind.slug()));
+        let mut cache = ClassCache::load(&cache_path);
+        let found = discover(&search_roots(kind, &extra), kind, &mut cache);
+        if let Err(e) = cache.save_if_changed(&cache_path) {
+            eprintln!("[radar] não consegui salvar a memória de reconhecimento: {e}");
+        }
+        found
+    };
+
+    let mut por_sala: Vec<(PokerRoom, Vec<DiscoveredFile>)> =
+        PokerRoom::ALL.into_iter().map(|room| (room, Vec::new())).collect();
+    for f in found {
+        if let Some((_, lista)) = por_sala.iter_mut().find(|(room, _)| *room == f.room) {
+            lista.push(f);
+        }
+    }
+    por_sala
 }
 
 #[derive(serde::Serialize)]
@@ -659,6 +686,11 @@ struct SyncSummary {
     duplicates: u32,
     errors: u32,
     ignored_by_date: u32,
+    /// Arquivos que o site recusou e ficaram de lado (ver `SyncState::record_failure`).
+    files_rejected: u32,
+    /// Arquivos achados de uma sala que o site ainda não sabe ler (ver
+    /// `envio_liberado`) — ficam esperando, sem ser enviados.
+    files_waiting: u32,
 }
 
 /// Arquivo cujas partes já estão todas no lote atual — só vira "enviado"
@@ -669,17 +701,55 @@ struct Concluido {
     enviado: SentText,
 }
 
-fn marcar_enviados(sync_state: &mut SyncState, state_path: &Path, concluidos: &mut Vec<Concluido>) {
+/// Marca como enviados os arquivos concluídos (menos os que o site recusou
+/// e ficaram de lado) e devolve quantos foram.
+fn marcar_enviados(
+    sync_state: &mut SyncState,
+    state_path: &Path,
+    concluidos: &mut Vec<Concluido>,
+    recusados: &HashSet<PathBuf>,
+) -> usize {
     if concluidos.is_empty() {
-        return;
+        return 0;
     }
+    let mut marcados = 0;
     for c in concluidos.drain(..) {
+        if recusados.contains(&c.path) {
+            continue;
+        }
         sync_state.mark_synced_text(c.path, c.signature, c.enviado);
+        marcados += 1;
     }
     // Progresso salvo a cada lote aceito: se o próximo lote falhar, o que
     // já foi não é reenviado.
+    salvar_progresso(sync_state, state_path);
+    marcados
+}
+
+fn salvar_progresso(sync_state: &SyncState, state_path: &Path) {
     if let Err(e) = sync_state.save(state_path) {
         eprintln!("[radar] não consegui salvar o progresso do envio: {e}");
+    }
+}
+
+/// Recusa do site que vale investigar arquivo por arquivo, em vez de parar
+/// o envio inteiro: `Some(true)` = recusa pelo conteúdo (corpo inválido,
+/// grande demais — tentar de novo não muda nada), `Some(false)` = erro ao
+/// processar no servidor (pode ser o arquivo, pode ser passageiro). `None`
+/// = problema que não é do arquivo (sessão, plano, escolha do que
+/// importar, limite de envios, site fora do ar, sem internet): para tudo
+/// e tenta no próximo ciclo, como antes.
+fn recusa_por_arquivo(falha: &Falha) -> Option<bool> {
+    let Falha::Site(SyncError::Rejected { status, code, .. }) = falha else {
+        return None;
+    };
+    if matches!(code.as_deref(), Some("IMPORT_SCOPE_NAO_DEFINIDO" | "RADAR_FORA_DO_PLANO")) {
+        return None;
+    }
+    match status {
+        400 | 413 | 415 | 422 => Some(true),
+        500 => Some(false),
+        _ => None,
     }
 }
 
@@ -707,6 +777,38 @@ fn trecho_para_enviar(kind: FileKind, texto: &str, antes: Option<SentText>) -> &
     }
 }
 
+/// Fila de pedaços de um lote recusado: cada recusa divide o pedaço ao
+/// meio, até sobrar o item culpado sozinho (ver `Envio::mandar_lote`).
+struct Isolamento {
+    fila: VecDeque<(Vec<SyncFile>, Vec<usize>)>,
+}
+
+impl Isolamento {
+    fn new(itens: Vec<SyncFile>, donos: Vec<usize>) -> Self {
+        Isolamento {
+            fila: VecDeque::from([(itens, donos)]),
+        }
+    }
+
+    fn proximo(&mut self) -> Option<(Vec<SyncFile>, Vec<usize>)> {
+        self.fila.pop_front()
+    }
+
+    /// O pedaço foi recusado. Com mais de um item, volta pra fila em duas
+    /// metades (na mesma ordem) e devolve `None`; com um só, devolve o
+    /// arquivo de onde ele veio.
+    fn recusado(&mut self, mut itens: Vec<SyncFile>, mut donos: Vec<usize>) -> Option<usize> {
+        if itens.len() <= 1 {
+            return donos.first().copied();
+        }
+        let meio = itens.len() / 2;
+        let (resto, resto_donos) = (itens.split_off(meio), donos.split_off(meio));
+        self.fila.push_front((resto, resto_donos));
+        self.fila.push_front((itens, donos));
+        None
+    }
+}
+
 /// Contexto de envio de um tipo de arquivo — guarda a chave atual e renova
 /// uma vez se o site responder 401 no meio.
 struct Envio<'a> {
@@ -720,6 +822,7 @@ struct Envio<'a> {
 
 impl Envio<'_> {
     async fn mandar(&mut self, room: &str, files: &[SyncFile], resumo: &mut SyncSummary) -> Result<(), Falha> {
+        let mut esperas = 0;
         loop {
             let tentativa = match self.kind {
                 FileKind::HandHistory => self
@@ -747,9 +850,64 @@ impl Envio<'_> {
                     self.chave = chave_de_acesso(self.app, Some(&self.chave)).await.map_err(Falha::Auth)?;
                     self.client = SyncClient::new(config::site_url(), self.chave.clone());
                 }
+                // Limite de envios por minuto do site: espera o que ele
+                // pediu e segue, em vez de largar o ciclo no meio (num
+                // histórico grande isso acontecia a cada poucos lotes).
+                Err(e) if e.status() == Some(429) && esperas < MAX_ESPERAS_LIMITE => {
+                    esperas += 1;
+                    let segundos = e.retry_after().unwrap_or(30).clamp(1, 60);
+                    tokio::time::sleep(Duration::from_secs(segundos)).await;
+                }
                 Err(e) => return Err(Falha::Site(e)),
             }
         }
+    }
+
+    /// Manda um lote. Se o site recusar por causa de algum arquivo (ver
+    /// `recusa_por_arquivo`), divide o lote ao meio e tenta cada metade, até
+    /// achar o arquivo culpado — que fica de lado (`recusados`) quando o
+    /// site o recusa pelo conteúdo, ou depois de algumas recusas seguidas.
+    /// Antes, um arquivo recusado travava tudo: o mesmo lote ia de novo a
+    /// cada ciclo, pra sempre, e nada depois dele chegava ao site.
+    #[allow(clippy::too_many_arguments)]
+    async fn mandar_lote(
+        &mut self,
+        room: &str,
+        files: Vec<SyncFile>,
+        donos: Vec<usize>,
+        pendentes: &[DiscoveredFile],
+        sync_state: &mut SyncState,
+        state_path: &Path,
+        resumo: &mut SyncSummary,
+        recusados: &mut HashSet<PathBuf>,
+    ) -> Result<(), Falha> {
+        let mut isolamento = Isolamento::new(files, donos);
+        while let Some((files, donos)) = isolamento.proximo() {
+            let falha = match self.mandar(room, &files, resumo).await {
+                Ok(()) => continue,
+                Err(f) => f,
+            };
+            let Some(por_conteudo) = recusa_por_arquivo(&falha) else {
+                return Err(falha);
+            };
+            let Some(dono) = isolamento.recusado(files, donos) else {
+                continue;
+            };
+            let arquivo = &pendentes[dono];
+            let desistiu =
+                sync_state.record_failure(arquivo.path.clone(), arquivo.signature, por_conteudo, now_unix());
+            salvar_progresso(sync_state, state_path);
+            if !desistiu {
+                return Err(falha);
+            }
+            eprintln!(
+                "[radar] o PokerSync recusou {} ({}) — deixado de lado, o resto segue",
+                arquivo.path.display(),
+                falha.mensagem()
+            );
+            recusados.insert(arquivo.path.clone());
+        }
+        Ok(())
     }
 }
 
@@ -778,10 +936,18 @@ async fn sincronizar_tipo(app: &AppHandle, kind: FileKind, device: &DeviceInfo) 
             ..Default::default()
         };
         let pendentes: Vec<DiscoveredFile> = pending_files(&found, &sync_state).into_iter().cloned().collect();
+        if !envio_liberado(room) {
+            resumo.files_waiting = pendentes.len() as u32;
+            out.push(resumo);
+            continue;
+        }
         let mut lote = BatchBuilder::new(MAX_FILES_PER_BATCH, MAX_BATCH_BYTES);
+        // De qual arquivo (índice em `pendentes`) veio cada item do lote.
+        let mut donos: Vec<usize> = Vec::new();
         let mut concluidos: Vec<Concluido> = Vec::new();
+        let mut recusados: HashSet<PathBuf> = HashSet::new();
 
-        for arquivo in &pendentes {
+        for (indice, arquivo) in pendentes.iter().enumerate() {
             // Apagado/movido no meio da varredura: fica pra próxima volta.
             let Ok(texto) = read_text(&arquivo.path) else {
                 continue;
@@ -796,13 +962,27 @@ async fn sincronizar_tipo(app: &AppHandle, kind: FileKind, device: &DeviceInfo) 
             };
             for parte in partes.into_iter().filter(|p| !p.trim().is_empty()) {
                 if lote.is_full_for(parte.len()) {
-                    envio.mandar(room.slug(), &lote.take(), &mut resumo).await?;
-                    marcar_enviados(&mut sync_state, &state_path, &mut concluidos);
+                    let itens = lote.take();
+                    let itens_donos = std::mem::take(&mut donos);
+                    envio
+                        .mandar_lote(
+                            room.slug(),
+                            itens,
+                            itens_donos,
+                            &pendentes,
+                            &mut sync_state,
+                            &state_path,
+                            &mut resumo,
+                            &mut recusados,
+                        )
+                        .await?;
+                    resumo.files_synced += marcar_enviados(&mut sync_state, &state_path, &mut concluidos, &recusados);
                 }
                 lote.push(SyncFile {
                     raw_text: parte.to_string(),
                     captured_at: None,
                 });
+                donos.push(indice);
             }
             concluidos.push(Concluido {
                 path: arquivo.path.clone(),
@@ -812,12 +992,25 @@ async fn sincronizar_tipo(app: &AppHandle, kind: FileKind, device: &DeviceInfo) 
                     fingerprint: fingerprint(&texto),
                 },
             });
-            resumo.files_synced += 1;
         }
         if !lote.is_empty() {
-            envio.mandar(room.slug(), &lote.take(), &mut resumo).await?;
+            let itens = lote.take();
+            let itens_donos = std::mem::take(&mut donos);
+            envio
+                .mandar_lote(
+                    room.slug(),
+                    itens,
+                    itens_donos,
+                    &pendentes,
+                    &mut sync_state,
+                    &state_path,
+                    &mut resumo,
+                    &mut recusados,
+                )
+                .await?;
         }
-        marcar_enviados(&mut sync_state, &state_path, &mut concluidos);
+        resumo.files_synced += marcar_enviados(&mut sync_state, &state_path, &mut concluidos, &recusados);
+        resumo.files_rejected = sync_state.given_up_count() as u32;
         out.push(resumo);
     }
     Ok(out)
@@ -958,9 +1151,13 @@ async fn ciclo_interno(app: &AppHandle, enviar: bool) -> Ciclo {
     }
 
     let mut novidades = 0u32;
+    let mut recusados = 0u32;
     for kind in [FileKind::HandHistory, FileKind::TournamentSummary] {
         match sincronizar_tipo(app, kind, &device).await {
-            Ok(resumos) => novidades += resumos.iter().map(|r| r.imported).sum::<u32>(),
+            Ok(resumos) => {
+                novidades += resumos.iter().map(|r| r.imported).sum::<u32>();
+                recusados += resumos.iter().map(|r| r.files_rejected).sum::<u32>();
+            }
             Err(f) => return registrar_falha(app, f),
         }
     }
@@ -968,6 +1165,7 @@ async fn ciclo_interno(app: &AppHandle, enviar: bool) -> Ciclo {
     atualizar_status(app, |s| {
         s.ultima_sincronizacao = Some(quando);
         s.ultimo_erro = None;
+        s.arquivos_recusados = recusados;
         if novidades > 0 {
             s.ultimas_novidades = Some(novidades);
             s.ultimas_novidades_em = Some(quando);
@@ -1194,6 +1392,7 @@ pub fn run() {
                 })),
                 logado: AtomicBool::new(logado),
                 sync_lock: tokio::sync::Mutex::new(()),
+                discover_lock: Mutex::new(()),
                 status: Mutex::new(status),
                 wake: tokio::sync::Notify::new(),
             });
@@ -1349,6 +1548,61 @@ mod tests {
             fingerprint: fingerprint(&texto[..5]),
         };
         assert_eq!(trecho_para_enviar(FileKind::TournamentSummary, texto, Some(registro)), texto);
+    }
+
+    fn rejeicao(status: u16, code: Option<&str>) -> Falha {
+        Falha::Site(SyncError::Rejected {
+            status,
+            code: code.map(str::to_string),
+            message: String::new(),
+            retry_after: None,
+        })
+    }
+
+    #[test]
+    fn only_file_related_rejections_are_isolated() {
+        assert_eq!(recusa_por_arquivo(&rejeicao(400, None)), Some(true));
+        assert_eq!(recusa_por_arquivo(&rejeicao(413, None)), Some(true));
+        assert_eq!(recusa_por_arquivo(&rejeicao(500, None)), Some(false));
+        // Não é culpa de um arquivo: para e tenta no próximo ciclo.
+        for status in [401, 403, 404, 429, 502, 503, 504] {
+            assert_eq!(recusa_por_arquivo(&rejeicao(status, None)), None, "status {status}");
+        }
+        assert_eq!(recusa_por_arquivo(&rejeicao(409, Some("IMPORT_SCOPE_NAO_DEFINIDO"))), None);
+        assert_eq!(recusa_por_arquivo(&Falha::Auth(AuthError::SemInternet)), None);
+    }
+
+    #[test]
+    fn isolation_finds_the_rejected_file_and_sends_the_rest() {
+        // 7 itens de 5 arquivos (o arquivo 2 tem três partes); o "site"
+        // recusa qualquer pedaço que contenha a parte "ruim".
+        let textos = ["a", "b", "c1", "ruim", "c3", "d", "e"];
+        let donos = vec![0, 1, 2, 2, 2, 3, 4];
+        let itens: Vec<SyncFile> = textos
+            .iter()
+            .map(|t| SyncFile {
+                raw_text: t.to_string(),
+                captured_at: None,
+            })
+            .collect();
+
+        let mut isolamento = Isolamento::new(itens, donos);
+        let mut aceitos = Vec::new();
+        let mut culpados = Vec::new();
+        let mut envios = 0;
+        while let Some((itens, donos)) = isolamento.proximo() {
+            envios += 1;
+            if itens.iter().any(|i| i.raw_text == "ruim") {
+                if let Some(dono) = isolamento.recusado(itens, donos) {
+                    culpados.push(dono);
+                }
+            } else {
+                aceitos.extend(itens.into_iter().map(|i| i.raw_text));
+            }
+        }
+        assert_eq!(culpados, vec![2]);
+        assert_eq!(aceitos, vec!["a", "b", "c1", "c3", "d", "e"]); // na ordem
+        assert!(envios <= 7, "{envios} envios");
     }
 
     #[test]

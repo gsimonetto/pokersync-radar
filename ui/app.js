@@ -286,6 +286,12 @@ function renderStatus(s) {
       const n = s.ultimas_novidades;
       partes.push(`${n} ${n === 1 ? "novo enviado" : "novos enviados"} ${tempoDesde(s.ultimas_novidades_em)}`);
     }
+    // Arquivos que o site recusou: ficam de lado (o Radar tenta de novo em
+    // um dia ou quando o arquivo mudar) e o resto segue sendo enviado.
+    if (s.arquivos_recusados) {
+      const r = s.arquivos_recusados;
+      partes.push(`${r} ${r === 1 ? "arquivo recusado" : "arquivos recusados"} pelo PokerSync`);
+    }
     detalhe = partes.join(" · ");
   }
   if (s.ultimo_erro && s.conexao !== "sem_internet") {
@@ -548,11 +554,18 @@ function renderImportResults(rows) {
 }
 
 function detalheDaSala(s) {
-  if (s.files_synced === 0) return "tudo sincronizado";
+  const recusados = s.files_rejected
+    ? `${s.files_rejected} arquivo(s) recusado(s) pelo PokerSync — o Radar tenta de novo amanhã`
+    : "";
+  if (s.files_waiting) {
+    return `${s.files_waiting} arquivo(s) encontrado(s) — o envio começa assim que o PokerSync aprender a ler essa sala`;
+  }
+  if (s.files_synced === 0) return recusados || "tudo sincronizado";
   const partes = [`${s.imported} nova(s)`, `${s.duplicates} repetida(s)`];
   // Mãos de antes do "só a partir de agora" escolhido no site.
   if (s.ignored_by_date) partes.push(`${s.ignored_by_date} de antes do corte`);
   partes.push(`${s.errors} c/ erro`);
+  if (recusados) partes.push(recusados);
   return partes.join(", ");
 }
 

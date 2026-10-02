@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::text::looks_like_hand_history;
+
 /// Dois tipos de arquivo que o agente varre — hand history (mãos jogadas)
 /// e resumo de torneio (buy-in/colocação/premiação, sem as mãos). São
 /// arquivos diferentes, em pastas diferentes, e alimentam endpoints
@@ -131,13 +133,27 @@ impl PokerRoom {
         }
     }
 
+    /// Pastas fora das pastas do usuário onde o cliente dessa sala grava
+    /// por padrão. O ACR instala em `C:\ACR Poker` e grava hand history (e
+    /// resumo de torneio) em `handHistory\<usuário>` ali dentro — antes o
+    /// jogador precisava adicionar essa pasta à mão.
+    fn fixed_roots(self) -> Vec<PathBuf> {
+        match self {
+            PokerRoom::Acr if cfg!(windows) => {
+                let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+                vec![PathBuf::from(format!("{drive}\\")).join("ACR Poker").join("handHistory")]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Pastas onde o cliente dessa sala plausivelmente grava hand history
     /// ou resumo de torneio (`kind`), para o sistema operacional atual.
     /// Caminhos que não existem no disco são descartados por quem chama
-    /// (ver `discover_files`), então listar candidatos "a mais" aqui é
+    /// (ver `discover`), então listar candidatos "a mais" aqui é
     /// seguro.
     pub fn default_search_paths(self, kind: FileKind) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
+        let mut roots = self.fixed_roots();
         let home = dirs::home_dir();
         let documents = dirs::document_dir();
         let config = dirs::config_dir(); // %APPDATA% no Windows, ~/.config no Linux
@@ -181,10 +197,7 @@ impl PokerRoom {
             }
             PokerRoom::Poker888 => head.contains("888poker") || head.contains("Game #"),
             PokerRoom::Acr => {
-                let lower = head.to_lowercase();
-                lower.contains("winning poker network")
-                    || lower.contains("americas cardroom")
-                    || head.contains("Stage #")
+                head.lines().any(is_wpn_hand_start) || head.contains("Stage #") || mentions_wpn(head)
             }
         }
     }
@@ -199,16 +212,16 @@ impl PokerRoom {
             PokerRoom::PokerStars => {
                 head.contains("PokerStars Tournament #") || head.contains("Torneio PokerStars #")
             }
-            PokerRoom::GgPoker => head.contains("GGPoker Tournament") || head.contains("Tournament #"),
+            // "Tournament #" sozinho é genérico demais: só vale quando o
+            // texto não fala da Winning Poker Network (resumo do ACR).
+            PokerRoom::GgPoker => {
+                head.contains("GGPoker Tournament") || (head.contains("Tournament #") && !mentions_wpn(head))
+            }
             PokerRoom::PartyPoker => {
                 head.to_lowercase().contains("partypoker") && head.to_lowercase().contains("tournament")
             }
             PokerRoom::Poker888 => head.contains("888poker") && head.to_lowercase().contains("tournament"),
-            PokerRoom::Acr => {
-                let lower = head.to_lowercase();
-                (lower.contains("winning poker network") || lower.contains("americas cardroom"))
-                    && lower.contains("tournament")
-            }
+            PokerRoom::Acr => mentions_wpn(head) && head.to_lowercase().contains("tournament"),
         }
     }
 
@@ -217,5 +230,106 @@ impl PokerRoom {
             FileKind::HandHistory => self.sniff(head),
             FileKind::TournamentSummary => self.sniff_tournament_summary(head),
         }
+    }
+
+    /// De qual sala é o arquivo, olhando só o começo dele (`head`). Cada
+    /// arquivo fica com UMA sala: primeiro a da pasta onde ele foi achado
+    /// (`hint`, quando é a pasta padrão de uma sala), depois as demais na
+    /// ordem de `ALL` (as confirmadas contra arquivo real primeiro).
+    ///
+    /// Arquivo que já começa com uma mão nunca é resumo de torneio: antes,
+    /// mão de torneio do PokerStars e do ACR ("... Tournament #123 ...")
+    /// caía na regra do resumo do GGPoker e era enviada como torneio do
+    /// GGPoker quando a pasta de mãos estava em "Importar torneios".
+    pub fn classify(kind: FileKind, head: &str, hint: Option<PokerRoom>) -> Option<PokerRoom> {
+        if kind == FileKind::TournamentSummary && looks_like_hand_history(head) {
+            return None;
+        }
+        hint.into_iter()
+            .chain(PokerRoom::ALL)
+            .find(|room| room.sniff_kind(kind, head))
+    }
+}
+
+/// Linha que abre uma mão da Winning Poker Network (ACR) no formato atual:
+/// "Hand #2134567890 - Holdem(No Limit) - $0.05/$0.10 - 2026/09/21 ...", ou
+/// "Hand #... - Tournament #... - ..." em torneio. Antes o Radar só
+/// procurava o nome da rede/sala, que não aparece nesse cabeçalho — e
+/// todo arquivo do ACR era descartado sem aviso.
+fn is_wpn_hand_start(line: &str) -> bool {
+    let l = line.trim_start_matches('\u{feff}').trim_start();
+    let Some(rest) = l.strip_prefix("Hand #") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with(" - ")
+}
+
+/// O texto cita a Winning Poker Network ou o Americas Cardroom pelo nome.
+fn mentions_wpn(head: &str) -> bool {
+    let lower = head.to_lowercase();
+    lower.contains("winning poker network") || lower.contains("americas cardroom")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACR_CASH: &str = "Hand #2134567890 - Holdem(No Limit) - $0.05/$0.10 - 2026/09/21 16:35:41 UTC\n\
+        Table 'Aurora' 6-max Seat #3 is the button\nSeat 1: Heroi ($10.00)\n";
+    const ACR_TORNEIO: &str = "Hand #2134567891 - Tournament #24305619 - Holdem(No Limit) - Level 1 (10.00/20.00) - 2026/09/21 18:00:05 UTC\n\
+        Table '24305619 1' 9-max Seat #1 is the button\n";
+    const PS_MAO_DE_TORNEIO: &str =
+        "PokerStars Hand #1234: Tournament #555, $10+$1 USD Hold'em No Limit - Level I (10/20) - 2026/09/21\n";
+
+    #[test]
+    fn recognizes_acr_hand_history() {
+        for texto in [ACR_CASH, ACR_TORNEIO] {
+            assert_eq!(PokerRoom::classify(FileKind::HandHistory, texto, None), Some(PokerRoom::Acr));
+        }
+    }
+
+    #[test]
+    fn hand_history_is_never_a_tournament_summary() {
+        for texto in [ACR_CASH, ACR_TORNEIO, PS_MAO_DE_TORNEIO] {
+            assert_eq!(PokerRoom::classify(FileKind::TournamentSummary, texto, None), None);
+        }
+    }
+
+    #[test]
+    fn real_tournament_summaries_still_recognized() {
+        let ps = "PokerStars Tournament #1234567890, No Limit Hold'em\nBuy-In: $10.00+$1.00\n";
+        assert_eq!(
+            PokerRoom::classify(FileKind::TournamentSummary, ps, None),
+            Some(PokerRoom::PokerStars)
+        );
+        let gg = "Tournament #123456789, Bounty Hunters $10, Hold'em No Limit\nBuy-in: $9.6+$0.4\n";
+        assert_eq!(
+            PokerRoom::classify(FileKind::TournamentSummary, gg, None),
+            Some(PokerRoom::GgPoker)
+        );
+        let acr = "Americas Cardroom Tournament #24305619\nBuy-In: $0.95 + $0.05\n";
+        assert_eq!(PokerRoom::classify(FileKind::TournamentSummary, acr, None), Some(PokerRoom::Acr));
+    }
+
+    #[test]
+    fn folder_hint_wins_over_order() {
+        // "Game #" casa com PartyPoker e com 888poker; na pasta do 888, é 888.
+        let texto = "Game #123 starts.\n";
+        assert_eq!(PokerRoom::classify(FileKind::HandHistory, texto, None), Some(PokerRoom::PartyPoker));
+        assert_eq!(
+            PokerRoom::classify(FileKind::HandHistory, texto, Some(PokerRoom::Poker888)),
+            Some(PokerRoom::Poker888)
+        );
+    }
+
+    #[test]
+    fn other_rooms_are_not_taken_for_acr() {
+        let ps = "PokerStars Hand #1: Hold'em No Limit ($0.01/$0.02) - 2026/09/21\n";
+        let gg = "Poker Hand #HD1: Hold'em No Limit ($0.01/$0.02) - 2026/09/21\n";
+        assert_eq!(PokerRoom::classify(FileKind::HandHistory, ps, None), Some(PokerRoom::PokerStars));
+        assert_eq!(PokerRoom::classify(FileKind::HandHistory, gg, None), Some(PokerRoom::GgPoker));
+        assert!(!is_wpn_hand_start("Hand #abc - x"));
+        assert!(!is_wpn_hand_start("Hand #123: x"));
     }
 }

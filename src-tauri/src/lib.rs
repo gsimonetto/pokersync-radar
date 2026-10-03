@@ -609,14 +609,14 @@ fn parse_kind(slug: &str) -> Result<FileKind, String> {
     FileKind::from_slug(slug).ok_or_else(|| format!("Tipo de import desconhecido: {slug}"))
 }
 
-/// Sala cujos arquivos o site já sabe ler. O ACR é reconhecido no
-/// computador (e entra nas contas da tela), mas ainda não é enviado: o
-/// site (`lib/poker/hand-parser.ts` em gsimonetto/pokersync) não separa as
-/// mãos desse formato e gravaria cada arquivo inteiro como uma "mão" só,
-/// marcada como enviada. Liberar aqui assim que o site aprender o formato
-/// — como nada foi marcado como enviado, o histórico inteiro vai na hora.
-fn envio_liberado(room: PokerRoom) -> bool {
-    room != PokerRoom::Acr
+/// Sala cujos arquivos o site já sabe ler. O ACR ficou segurado aqui até o
+/// site aprender o formato (`lib/poker/hand-parser.ts` e o resumo .ots em
+/// `lib/poker/tournament-summary-parser.ts`, em gsimonetto/pokersync,
+/// validados com arquivos reais em 03/10/2026) — liberado. Como nada do ACR
+/// tinha sido marcado como enviado, o histórico inteiro vai na hora. Fica a
+/// função pra próxima sala que o site ainda não souber ler.
+fn envio_liberado(_room: PokerRoom) -> bool {
+    true
 }
 
 /// Nome do arquivo de estado por (sala, tipo) — mãos e torneios têm
@@ -1047,6 +1047,7 @@ async fn sincronizar_tipo(app: &AppHandle, kind: FileKind, device: &DeviceInfo) 
                 lote.push(SyncFile {
                     raw_text: parte.to_string(),
                     captured_at: None,
+                    file_name: arquivo.path.file_name().map(|n| n.to_string_lossy().into_owned()),
                 });
                 donos.push(indice);
             }
@@ -1539,6 +1540,7 @@ async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<String>) -> Re
                     lote.push(SyncFile {
                         raw_text: parte.to_string(),
                         captured_at: None,
+                        file_name: None,
                     });
                     donos.push(indice);
                 }
@@ -1941,6 +1943,7 @@ mod tests {
             .map(|t| SyncFile {
                 raw_text: t.to_string(),
                 captured_at: None,
+                file_name: None,
             })
             .collect();
 
@@ -2000,9 +2003,9 @@ mod tests {
         let gg = com_situacao(PokerRoom::GgPoker, painel(0, 0, 0, 0));
         assert!(gg.dica.unwrap().contains("PokerCraft"));
 
+        // O ACR não espera mais o site: com mão pendente, é envio normal.
         let acr = com_situacao(PokerRoom::Acr, painel(40, 0, 1, 40));
-        assert_eq!(acr.situacao, "aguardando_site");
-        assert!(acr.dica.unwrap().contains("aprender a ler"));
+        assert_eq!(acr.situacao, "pendente");
     }
 
     #[test]

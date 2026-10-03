@@ -53,6 +53,10 @@ pub struct SyncFile {
     pub raw_text: String,
     #[serde(rename = "capturedAt", skip_serializing_if = "Option::is_none")]
     pub captured_at: Option<String>,
+    /// Só o nome do arquivo no disco (sem a pasta). Na ACR é o único lugar
+    /// com o buy-in (resumo) e o nome do torneio (mãos).
+    #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -388,6 +392,7 @@ mod tests {
         SyncFile {
             raw_text: text.into(),
             captured_at: None,
+            file_name: None,
         }
     }
 
@@ -506,11 +511,12 @@ mod tests {
         let files = vec![SyncFile {
             raw_text: "PokerStars Hand #1: ...".into(),
             captured_at: Some("2026-08-01T00:00:00Z".into()),
+            file_name: Some("HH20260801 Mesa.txt".into()),
         }];
         let expected_body = serde_json::json!({
             "device": {"deviceId": "dev-1", "deviceName": "Meu PC", "platform": "linux", "agentVersion": "0.1.0"},
             "pokerRoom": "pokerstars",
-            "files": [{"rawText": "PokerStars Hand #1: ...", "capturedAt": "2026-08-01T00:00:00Z"}],
+            "files": [{"rawText": "PokerStars Hand #1: ...", "capturedAt": "2026-08-01T00:00:00Z", "fileName": "HH20260801 Mesa.txt"}],
         });
 
         Mock::given(method("POST"))

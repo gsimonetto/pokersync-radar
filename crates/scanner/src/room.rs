@@ -196,8 +196,12 @@ impl PokerRoom {
                 head.to_lowercase().contains("partypoker") || head.contains("Game #")
             }
             PokerRoom::Poker888 => head.contains("888poker") || head.contains("Game #"),
+            // O resumo de torneio da ACR (JSON) também cita a rede pelo
+            // nome; sem o `!is_json` ele virava "mão" e ia pro lugar errado.
             PokerRoom::Acr => {
-                head.lines().any(is_wpn_hand_start) || head.contains("Stage #") || mentions_wpn(head)
+                head.lines().any(is_wpn_hand_start)
+                    || head.contains("Stage #")
+                    || (mentions_wpn(head) && !is_json(head))
             }
         }
     }
@@ -256,8 +260,14 @@ impl PokerRoom {
 /// "Hand #... - Tournament #... - ..." em torneio. Antes o Radar só
 /// procurava o nome da rede/sala, que não aparece nesse cabeçalho — e
 /// todo arquivo do ACR era descartado sem aviso.
+///
+/// Arquivo REAL da ACR (03/10/2026) começa com "Game Hand #" ("Game Hand
+/// #2838198875 - Tournament #36074377 - Holdem (No Limit) - Level 10 ..."),
+/// não só "Hand #" — sem aceitar o "Game " na frente, as mãos de verdade
+/// continuavam sendo descartadas.
 fn is_wpn_hand_start(line: &str) -> bool {
     let l = line.trim_start_matches('\u{feff}').trim_start();
+    let l = l.strip_prefix("Game ").unwrap_or(l);
     let Some(rest) = l.strip_prefix("Hand #") else {
         return false;
     };
@@ -266,9 +276,16 @@ fn is_wpn_hand_start(line: &str) -> bool {
 }
 
 /// O texto cita a Winning Poker Network ou o Americas Cardroom pelo nome.
+/// O resumo de torneio real (JSON, .ots) escreve tudo junto:
+/// "network_name":"WinningPokerNetwork", "site_name":"AmericasCardroom".
 fn mentions_wpn(head: &str) -> bool {
-    let lower = head.to_lowercase();
-    lower.contains("winning poker network") || lower.contains("americas cardroom")
+    let lower = head.to_lowercase().replace(' ', "");
+    lower.contains("winningpokernetwork") || lower.contains("americascardroom")
+}
+
+/// Começa com "{" — o resumo de torneio da ACR é um JSON numa linha só.
+fn is_json(head: &str) -> bool {
+    head.trim_start_matches('\u{feff}').trim_start().starts_with('{')
 }
 
 #[cfg(test)]
@@ -287,6 +304,23 @@ mod tests {
         for texto in [ACR_CASH, ACR_TORNEIO] {
             assert_eq!(PokerRoom::classify(FileKind::HandHistory, texto, None), Some(PokerRoom::Acr));
         }
+    }
+
+    // Começo dos arquivos REAIS da ACR (03/10/2026): mãos e resumo (.ots).
+    const ACR_MAO_REAL: &str = "Game Hand #2838198875 - Tournament #36074377 - Holdem (No Limit) - Level 10 (1800.00/3600.00) - 2026/10/03 17:48:09 UTC\n\
+        Table '20' 8-max Seat #7 is the button\nSeat 1: Vilao (599896.00)\n";
+    const ACR_RESUMO_REAL: &str = r#"{"spec_version":"1.0.0","network_name":"WinningPokerNetwork","tournament_number":"T#36074377","start_date_utc":"2026-10-03T17:47:59Z","player_count":308,"tournament_finishes_and_winnings":[{"player_name":"Vilao","finish_position":1,"prize":0,"ticket_value":0}],"site_name":"AmericasCardroom"}"#;
+
+    #[test]
+    fn recognizes_real_acr_files() {
+        assert_eq!(PokerRoom::classify(FileKind::HandHistory, ACR_MAO_REAL, None), Some(PokerRoom::Acr));
+        assert_eq!(PokerRoom::classify(FileKind::TournamentSummary, ACR_MAO_REAL, None), None);
+        assert_eq!(
+            PokerRoom::classify(FileKind::TournamentSummary, ACR_RESUMO_REAL, None),
+            Some(PokerRoom::Acr)
+        );
+        // Mesmo achado na pasta da ACR, o resumo não é mão.
+        assert_eq!(PokerRoom::classify(FileKind::HandHistory, ACR_RESUMO_REAL, Some(PokerRoom::Acr)), None);
     }
 
     #[test]

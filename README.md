@@ -61,9 +61,11 @@ Do lado do produto, em `gsimonetto/pokersync` (`app/`, `lib/`):
    torneio. PokerStars e GGPoker são confirmados contra hand history real
    (mesmos marcadores do parser); PartyPoker/888poker/ACR usam regras mais
    fracas, documentadas em `crates/scanner/src/room.rs` (o ACR é
-   reconhecido pela linha "Hand #123 - ..." da Winning Poker Network, mas
-   só é enviado depois que o site aprender a ler esse formato — ver
-   `envio_liberado` em `src-tauri/src/lib.rs`). A
+   reconhecido pela linha "Game Hand #123 - ..." da Winning Poker Network,
+   validada com arquivo real em 03/10/2026, e o resumo de torneio dele é um
+   JSON `.ots` na mesma pasta das mãos; o nome de cada arquivo vai junto no
+   envio, em `fileName`, porque na ACR o buy-in e o nome do torneio só
+   existem ali). A
    sala de cada arquivo fica guardada (`ClassCache`,
    `sync-state/reconhecidos-*.json`): arquivo que não mudou não é aberto de
    novo no ciclo seguinte. Ao mudar as regras de reconhecimento, suba
@@ -230,5 +232,3 @@ cada sala pra substituir.
   "app não verificado" ao instalar). O ícone (cartas do logo PokerSync) já
   é o definitivo: `src-tauri/icons/`, com versão simplificada pros
   tamanhos pequenos.
-- Liberar o envio do ACR (`envio_liberado` em `src-tauri/src/lib.rs`)
-  quando `hand-parser.ts` passar a ler o formato da Winning Poker Network.

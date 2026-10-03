@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 /// Sobe quando as regras de reconhecimento (`PokerRoom::classify`) mudam:
 /// a memória antiga é jogada fora e todo arquivo é reconhecido de novo
 /// pelas regras novas (ex.: arquivos do ACR que antes eram ignorados).
-pub const CLASSIFIER_VERSION: u32 = 1;
+/// 2: mão real do ACR ("Game Hand #") e resumo .ots (JSON) — 03/10/2026.
+pub const CLASSIFIER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {

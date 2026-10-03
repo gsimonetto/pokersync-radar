@@ -35,12 +35,13 @@ pub struct PendingFile {
     pub signature: FileSignature,
 }
 
-/// Arquivo com extensão de hand history (.txt/.log) — os únicos que a
-/// varredura e a vigilância das pastas olham.
+/// Arquivo com extensão de hand history (.txt/.log) ou de resumo de
+/// torneio da ACR (.ots, um JSON) — os únicos que a varredura e a
+/// vigilância das pastas olham.
 pub fn has_text_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("txt") || e.eq_ignore_ascii_case("log"))
+        .map(|e| ["txt", "log", "ots"].iter().any(|x| e.eq_ignore_ascii_case(x)))
         .unwrap_or(false)
 }
 
@@ -184,6 +185,30 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn discovers_acr_hands_and_ots_summary_in_the_same_folder() {
+        // Na ACR as mãos (.txt) e o resumo (.ots, JSON) ficam juntos em
+        // C:\ACR Poker\handHistory\<usuário>.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "HH20261003_SCHEDULEDID-G36074377T20_TN-PKO - 20000 GTD_GAMETYPE-Holdem_LIMIT-no_CUR-REAL_OND-F_BUYIN-0.txt",
+            "Game Hand #2838198875 - Tournament #36074377 - Holdem (No Limit) - Level 10 (1800.00/3600.00) - 2026/10/03 17:48:09 UTC\n",
+        );
+        write(
+            dir.path(),
+            "TS20261003_T36074377_E1312590432_NL_Hold_em_50.00__5.00.ots",
+            r#"{"spec_version":"1.0.0","network_name":"WinningPokerNetwork","tournament_number":"T#36074377","site_name":"AmericasCardroom"}"#,
+        );
+        let roots = [dir.path().to_path_buf()];
+        let maos = discover_files(&roots, PokerRoom::Acr, FileKind::HandHistory);
+        let resumos = discover_files(&roots, PokerRoom::Acr, FileKind::TournamentSummary);
+        assert_eq!(maos.len(), 1);
+        assert!(maos[0].path.to_string_lossy().ends_with(".txt"));
+        assert_eq!(resumos.len(), 1);
+        assert!(resumos[0].path.to_string_lossy().ends_with(".ots"));
     }
 
     #[test]

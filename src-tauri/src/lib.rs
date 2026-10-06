@@ -237,6 +237,10 @@ impl AuthError {
     }
 }
 
+/// Código que o site manda (403) quando o jogador desconectou este
+/// computador em Minha Conta -- ver lib/supabase/agent-device.ts no site.
+const DISPOSITIVO_DESCONECTADO: &str = "DISPOSITIVO_DESCONECTADO";
+
 enum Falha {
     Auth(AuthError),
     Site(SyncError),
@@ -299,6 +303,29 @@ async fn chave_de_acesso(app: &AppHandle, falhou: Option<&str>) -> Result<String
 /// notificação — antes o Radar continuava mostrando "logado" e falhando
 /// calado a cada 5 minutos.
 fn sessao_expirou(app: &AppHandle) {
+    sessao_encerrada(
+        app,
+        "Sua sessão expirou. Abra o Radar e entre de novo pra continuar sincronizando suas mãos.",
+    );
+}
+
+/// O site avisou que este computador foi desconectado da conta (Minha
+/// Conta → Desconectar, código DISPOSITIVO_DESCONECTADO): mesmo destino da
+/// sessão expirada -- volta pra tela de login -- em vez de ficar tentando
+/// a cada 5 minutos com o card dizendo "Tudo certo". Entrar de novo aqui
+/// religa o computador (o site libera logins feitos depois da desconexão).
+fn dispositivo_desconectado(app: &AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        *handle.state::<AppState>().session.lock().await = None;
+    });
+    sessao_encerrada(
+        app,
+        "Este computador foi desconectado da sua conta PokerSync. Para voltar a sincronizar, abra o Radar e entre de novo.",
+    );
+}
+
+fn sessao_encerrada(app: &AppHandle, aviso: &str) {
     let state = app.state::<AppState>();
     state.logado.store(false, Ordering::SeqCst);
     let _ = keychain::clear();
@@ -316,7 +343,7 @@ fn sessao_expirou(app: &AppHandle) {
         .notification()
         .builder()
         .title("Radar PokerSync")
-        .body("Sua sessão expirou. Abra o Radar e entre de novo pra continuar sincronizando suas mãos.")
+        .body(aviso)
         .show();
 }
 
@@ -1175,6 +1202,10 @@ fn registrar_falha(app: &AppHandle, falha: Falha) -> Ciclo {
     match falha {
         // Status já atualizado em `sessao_expirou` (ou nunca houve login).
         Falha::Auth(AuthError::NaoLogado) | Falha::Auth(AuthError::Expirada) => Ciclo::SemSessao,
+        Falha::Site(ref e) if e.code() == Some(DISPOSITIVO_DESCONECTADO) => {
+            dispositivo_desconectado(app);
+            Ciclo::SemSessao
+        }
         Falha::Auth(e @ AuthError::SemInternet) => {
             let mensagem = e.mensagem();
             atualizar_status(app, |s| {

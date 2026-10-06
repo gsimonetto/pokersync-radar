@@ -91,6 +91,18 @@ pub fn ler_escolhidos(caminhos: &[PathBuf]) -> Result<Leitura, String> {
     };
 
     for caminho in caminhos {
+        // Defesa extra (os caminhos vêm da janela do SO, ver
+        // `escolher_arquivos_para_importar` em lib.rs): resolve links e
+        // `..`, e só lê arquivo comum com extensão conhecida (.zip ou
+        // texto de mão) — pasta, dispositivo, pipe etc. ficam de fora.
+        let Ok(resolvido) = std::fs::canonicalize(caminho) else {
+            return Err(format!("Não consegui abrir {}.", nome(caminho)));
+        };
+        let e_arquivo = std::fs::metadata(&resolvido).is_ok_and(|m| m.is_file());
+        if !e_arquivo || !(e_zip(&resolvido) || has_text_extension(&resolvido)) {
+            continue;
+        }
+        let caminho = &resolvido;
         if e_zip(caminho) {
             let arquivo = std::fs::File::open(caminho)
                 .map_err(|e| format!("Não consegui abrir {}: {e}", nome(caminho)))?;
@@ -201,6 +213,20 @@ mod tests {
             grupos,
             vec![("ggpoker", "hands", 1), ("ggpoker", "tournaments", 1), ("pokerstars", "hands", 1)]
         );
+    }
+
+    #[test]
+    fn skips_folders_and_unknown_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let pasta = dir.path().join("pasta.txt");
+        std::fs::create_dir_all(&pasta).unwrap();
+        let exe = dir.path().join("programa.exe");
+        std::fs::write(&exe, PS_MAO).unwrap();
+        let leitura = ler_escolhidos(&[pasta, exe]).unwrap();
+        assert_eq!(leitura.arquivos_lidos, 0);
+        assert!(leitura.grupos.is_empty());
+        let erro = ler_escolhidos(&[dir.path().join("nao-existe.txt")]).unwrap_err();
+        assert!(erro.contains("nao-existe.txt"), "{erro}");
     }
 
     #[test]

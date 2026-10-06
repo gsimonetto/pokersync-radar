@@ -19,6 +19,18 @@ use walkdir::WalkDir;
 
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024; // hand history de anos ainda cabe tranquilo
 const SNIFF_BYTES: usize = 4096;
+/// Até quantos níveis de subpasta a varredura desce a partir de cada
+/// pasta. As salas gravam no máximo 2-3 níveis abaixo da pasta de hand
+/// history (ex.: `HandHistory\<usuário>\<arquivo>`); o limite só existe
+/// pra uma pasta extra escolhida "alta demais" não virar uma varredura do
+/// disco inteiro.
+pub const MAX_SCAN_DEPTH: usize = 6;
+/// Teto de entradas (arquivos e pastas) olhadas por varredura em CADA
+/// pasta extra (as adicionadas pelo jogador). Um histórico de anos de um
+/// grinder fica na casa das dezenas de milhares de arquivos; acima disso a
+/// pasta é ampla demais e o resto é ignorado (o ciclo de 5 minutos não
+/// pode virar uma leitura do disco inteiro a cada volta).
+pub const MAX_ENTRIES_PER_EXTRA_ROOT: usize = 200_000;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {
@@ -104,14 +116,28 @@ pub fn search_roots(kind: FileKind, extra: &[PathBuf]) -> Vec<SearchRoot> {
 /// reconhecidos vêm de `cache`. O conteúdo inteiro só é lido na hora do
 /// envio, e só pros arquivos que realmente precisam sincronizar.
 pub fn discover(roots: &[SearchRoot], kind: FileKind, cache: &mut ClassCache) -> Vec<DiscoveredFile> {
+    discover_with_limit(roots, kind, cache, MAX_ENTRIES_PER_EXTRA_ROOT)
+}
+
+fn discover_with_limit(
+    roots: &[SearchRoot],
+    kind: FileKind,
+    cache: &mut ClassCache,
+    max_entries_extra: usize,
+) -> Vec<DiscoveredFile> {
     let mut found = Vec::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
     for root in roots {
         if !root.path.is_dir() {
             continue;
         }
+        // Pasta padrão de sala (`hint`) não tem teto de quantidade — é a
+        // pasta onde a própria sala grava; só as extras têm.
+        let max_entries = if root.hint.is_some() { usize::MAX } else { max_entries_extra };
         for entry in WalkDir::new(&root.path)
+            .max_depth(MAX_SCAN_DEPTH)
             .into_iter()
+            .take(max_entries)
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
@@ -146,6 +172,46 @@ pub fn discover(roots: &[SearchRoot], kind: FileKind, cache: &mut ClassCache) ->
         }
     }
     found
+}
+
+/// A pasta é a raiz de um disco, a pasta pessoal do usuário ou uma pasta
+/// ACIMA dela (ex.: `/home`, `C:\Users`). Varrer isso como "pasta extra"
+/// leria (e mandaria pro site o que parecesse mão de) tudo do usuário —
+/// nunca vale, nem pra quem já tinha salvo uma assim.
+pub fn is_home_or_above(path: &Path) -> bool {
+    is_home_or_above_with(path, dirs::home_dir().as_deref())
+}
+
+/// `is_home_or_above` ou uma das pastas pessoais amplas (Documentos,
+/// Downloads, Área de trabalho) — onde fica de tudo, não só hand history.
+/// As salas gravam em subpastas próprias, que já são varridas sozinhas (ver
+/// `PokerRoom::default_search_paths`); quem quer uma pasta extra escolhe a
+/// subpasta certa.
+pub fn is_too_broad_folder(path: &Path) -> bool {
+    let personal: Vec<PathBuf> = [dirs::document_dir(), dirs::download_dir(), dirs::desktop_dir()]
+        .into_iter()
+        .flatten()
+        .collect();
+    is_home_or_above(path) || is_one_of(path, &personal)
+}
+
+/// Caminho resolvido (links e `..`), ou o próprio quando não existe.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_home_or_above_with(path: &Path, home: Option<&Path>) -> bool {
+    let path = canonical(path);
+    // Raiz (`/`, `C:\`, `\\?\D:\`): não tem pasta-mãe.
+    if path.parent().is_none() {
+        return true;
+    }
+    home.is_some_and(|home| canonical(home).starts_with(&path))
+}
+
+fn is_one_of(path: &Path, folders: &[PathBuf]) -> bool {
+    let path = canonical(path);
+    folders.iter().any(|f| canonical(f) == path)
 }
 
 /// Filtra `files` pelos que mudaram desde o último sync (via `state`) e lê
@@ -435,5 +501,61 @@ mod tests {
         let saved = std::fs::read_to_string(&cache_path).unwrap();
         assert!(!saved.contains("HH.txt"));
         assert!(saved.contains("notes.txt"));
+    }
+
+    #[test]
+    fn scan_stops_at_max_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fundo = dir.path().to_path_buf();
+        for i in 0..MAX_SCAN_DEPTH {
+            fundo = fundo.join(format!("n{i}"));
+        }
+        std::fs::create_dir_all(&fundo).unwrap();
+        // Arquivo a MAX_SCAN_DEPTH níveis da raiz: entra.
+        let raso = fundo.parent().unwrap();
+        write(raso, "HH raso.txt", "PokerStars Hand #1: Hold'em No Limit\n");
+        // Um nível abaixo do limite: fica de fora.
+        write(&fundo, "HH fundo.txt", "PokerStars Hand #2: Hold'em No Limit\n");
+        let found = discover(&extra_root(dir.path()), FileKind::HandHistory, &mut ClassCache::new());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("HH raso.txt"));
+    }
+
+    #[test]
+    fn extra_root_scan_is_capped_but_default_root_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            write(dir.path(), &format!("HH{i}.txt"), &format!("PokerStars Hand #{i}: Hold'em No Limit\n"));
+        }
+        // A própria raiz conta como entrada: 4 entradas = raiz + 3 arquivos.
+        let extra = discover_with_limit(&extra_root(dir.path()), FileKind::HandHistory, &mut ClassCache::new(), 4);
+        assert_eq!(extra.len(), 3);
+        let padrao = vec![SearchRoot {
+            path: dir.path().to_path_buf(),
+            hint: Some(PokerRoom::PokerStars),
+        }];
+        let todos = discover_with_limit(&padrao, FileKind::HandHistory, &mut ClassCache::new(), 4);
+        assert_eq!(todos.len(), 10);
+    }
+
+    #[test]
+    fn broad_folders_are_recognized() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home").join("jogador");
+        let docs = home.join("Documents");
+        let pasta_hh = docs.join("PokerStars").join("HandHistory");
+        std::fs::create_dir_all(&pasta_hh).unwrap();
+
+        assert!(is_home_or_above_with(Path::new("/"), Some(&home)));
+        assert!(is_home_or_above_with(&home, Some(&home)));
+        assert!(is_home_or_above_with(&dir.path().join("home"), Some(&home)));
+        // Mesmo escrita com ".." no meio.
+        assert!(is_home_or_above_with(&docs.join(".."), Some(&home)));
+        assert!(!is_home_or_above_with(&pasta_hh, Some(&home)));
+        assert!(!is_home_or_above_with(&docs, Some(&home)));
+
+        assert!(is_one_of(&docs, std::slice::from_ref(&docs)));
+        assert!(!is_one_of(&pasta_hh, std::slice::from_ref(&docs)));
+        assert!(is_too_broad_folder(Path::new("/")));
     }
 }

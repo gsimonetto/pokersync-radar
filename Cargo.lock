@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "pokersync-agent"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "keyring",
@@ -3048,6 +3048,7 @@ dependencies = [
  "scanner",
  "serde",
  "serde_json",
+ "sha2",
  "sync-client",
  "tauri",
  "tauri-build",
@@ -3694,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "scanner"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -4217,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "sync-client"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

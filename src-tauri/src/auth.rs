@@ -180,6 +180,35 @@ struct ExchangeCodeResponse {
     refresh_token: String,
 }
 
+/// Tamanho do `code_verifier` do PKCE (RFC 7636 aceita de 43 a 128).
+const CODE_VERIFIER_LEN: usize = 64;
+
+/// Segredo do PKCE (RFC 7636) do login com Google: 64 caracteres
+/// [A-Za-z0-9] sorteados do gerador do SO. Fica só na memória do Radar
+/// (junto do nonce `state`, ver `start_google_login` em lib.rs) e só sai
+/// daqui no POST da troca do código — nunca passa pelo navegador nem pelo
+/// deep link. Assim, quem interceptar o `code` do deep link (outro
+/// programa registrado no mesmo esquema `radar-pokersync://`, histórico
+/// do navegador, link colado no lugar errado) não consegue trocá-lo pela
+/// sessão sem também ter este segredo.
+pub fn novo_code_verifier() -> String {
+    use rand::Rng;
+    rand::rngs::OsRng
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(CODE_VERIFIER_LEN)
+        .map(char::from)
+        .collect()
+}
+
+/// `code_challenge` do método S256 do PKCE: base64url SEM padding do
+/// SHA-256 dos bytes ASCII do verifier (sempre 43 caracteres). É o que vai
+/// na URL de /agent-login — o site guarda junto do código de uso único e,
+/// na troca, confere que o `code_verifier` enviado bate com ele.
+pub fn code_challenge(code_verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
+}
+
 /// Troca o código de uso único do login do agente (gerado em
 /// `app/auth/confirm` no produto quando o login com Google volta pro
 /// agente) pelos tokens de sessão reais. O deep link
@@ -188,13 +217,15 @@ struct ExchangeCodeResponse {
 /// "copiar link" (ver `app/agent-login/concluido` no produto e
 /// `app/api/agent/exchange-code/route.ts`). O código é de uso único e
 /// expira em minutos, então mesmo exposto (histórico do navegador,
-/// logs) não vale nada depois de trocado ou vencido.
-pub async fn exchange_login_code(base_url: &str, code: &str) -> Result<LoginResult, String> {
+/// logs) não vale nada depois de trocado ou vencido. Além disso vai o
+/// `code_verifier` do PKCE (ver `novo_code_verifier`): sem ele o site
+/// recusa a troca, então o código sozinho não serve pra ninguém.
+pub async fn exchange_login_code(base_url: &str, code: &str, code_verifier: &str) -> Result<LoginResult, String> {
     let client = sync_client::http_client();
     let url = format!("{base_url}/api/agent/exchange-code");
     let resp = client
         .post(url)
-        .json(&serde_json::json!({ "code": code }))
+        .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
         .send()
         .await
         .map_err(|_| SEM_CONEXAO.to_string())?;
@@ -241,7 +272,9 @@ pub async fn fetch_user_email(access_token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_email_from_jwt, seconds_until_expiry, traduzir_erro_login};
+    use super::{
+        code_challenge, decode_email_from_jwt, novo_code_verifier, seconds_until_expiry, traduzir_erro_login,
+    };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     fn fake_jwt(payload_json: &str) -> String {
@@ -287,5 +320,27 @@ mod tests {
         assert_eq!(traduzir_erro_login("Invalid login credentials"), "Email ou senha inválidos.");
         assert!(traduzir_erro_login("Email not confirmed").starts_with("Confirme seu email"));
         assert_eq!(traduzir_erro_login("Outra coisa"), "Outra coisa");
+    }
+
+    /// Exemplo publicado do método S256 na RFC 7636 (Apêndice B) — o site
+    /// calcula do mesmo jeito; se isto mudar, nenhum login com Google fecha.
+    #[test]
+    fn pkce_challenge_matches_rfc7636_example() {
+        assert_eq!(
+            code_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn pkce_verifier_is_64_alphanumeric_and_random() {
+        let a = novo_code_verifier();
+        let b = novo_code_verifier();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_alphanumeric()), "{a}");
+        assert_ne!(a, b);
+        let challenge = code_challenge(&a);
+        assert_eq!(challenge.len(), 43);
+        assert!(!challenge.contains('='));
     }
 }

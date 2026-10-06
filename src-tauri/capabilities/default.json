@@ -1,14 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capacidades padrão da janela do agente",
+  "description": "Capacidades da janela do agente — só o que ui/app.js chama de verdade: a janela de escolher pasta (dialog.open), o auto-update (updater.check/downloadAndInstall) e o reinício depois dele (process.relaunch). Abrir o navegador (opener) e o deep link rodam só no lado Rust e não precisam de permissão pro JS.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:default",
-    "opener:default",
-    "deep-link:default",
+    "dialog:allow-open",
     "updater:default",
-    "process:default"
+    "process:allow-restart"
   ]
 }

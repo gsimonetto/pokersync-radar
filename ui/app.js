@@ -475,29 +475,30 @@ function resultadoDaLinha(l) {
   return partes.join(", ");
 }
 
-el("btn-import-files").addEventListener("click", async () => {
-  const escolhidos = await openFolderDialog({
-    multiple: true,
-    directory: false,
-    title: "Escolher arquivos baixados (.zip ou .txt)",
-    filters: [{ name: "Histórico de mãos", extensions: ["zip", "txt"] }],
-  });
-  if (!escolhidos || (Array.isArray(escolhidos) && escolhidos.length === 0)) return;
-  const caminhos = Array.isArray(escolhidos) ? escolhidos : [escolhidos];
-
+// A janela de escolher arquivos é aberta pelo lado Rust (importar_arquivos):
+// a tela não manda caminho nenhum, então não dá pra pedir pro Radar ler um
+// arquivo que o jogador não escolheu. "importacao-iniciada" chega depois da
+// escolha, com quantos arquivos vão ser lidos.
+listen("importacao-iniciada", (event) => {
   el("arquivos-panel").classList.remove("hidden");
   el("arquivos-tabela").classList.add("hidden");
-  const status = el("arquivos-status");
-  setStatus(status, `Lendo e enviando ${caminhos.length} arquivo(s)…`);
+  setStatus(el("arquivos-status"), `Lendo e enviando ${Number(event.payload) || 0} arquivo(s)…`);
   el("arquivos-panel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+});
+
+el("btn-import-files").addEventListener("click", async () => {
+  const btn = el("btn-import-files");
+  const status = el("arquivos-status");
+  btn.disabled = true;
   try {
-    const r = await invoke("importar_arquivos", { caminhos });
+    const r = await invoke("importar_arquivos");
+    if (!r) return; // cancelou a escolha
     const corpo = el("arquivos-corpo");
     corpo.innerHTML = "";
     for (const l of r.linhas) {
       const tr = document.createElement("tr");
       const sala = document.createElement("td");
-      sala.innerHTML = roomLabel(l.sala); // rótulo montado só com dados fixos (list_rooms/ROOM_STYLE)
+      sala.appendChild(roomLabel(l.sala));
       const tipo = document.createElement("td");
       tipo.textContent = TIPO_ARQUIVO[l.tipo] ?? l.tipo;
       const resultado = document.createElement("td");
@@ -515,7 +516,10 @@ el("btn-import-files").addEventListener("click", async () => {
     }
     carregarSalas();
   } catch (err) {
+    el("arquivos-panel").classList.remove("hidden");
     setStatus(status, String(err), "err");
+  } finally {
+    btn.disabled = false;
   }
 });
 
@@ -647,11 +651,20 @@ async function loadRooms() {
   rooms = await invoke("list_rooms");
 }
 
+// Devolve nós do DOM (nunca HTML em texto): o slug vem do lado Rust e,
+// se um dia chegar uma sala desconhecida, ele entra como texto puro.
 function roomLabel(slug) {
-  const name = rooms.find((r) => r.slug === slug)?.display_name ?? slug;
+  const frag = document.createDocumentFragment();
+  const name = rooms.find((r) => r.slug === slug)?.display_name ?? String(slug ?? "");
   const style = ROOM_STYLE[slug];
-  if (!style) return name;
-  return `<span class="room-dot" style="background:${style.accent}"></span>${name}`;
+  if (style) {
+    const dot = document.createElement("span");
+    dot.className = "room-dot";
+    dot.style.background = style.accent;
+    frag.appendChild(dot);
+  }
+  frag.appendChild(document.createTextNode(name));
+  return frag;
 }
 
 function renderImportFolders() {
@@ -729,7 +742,13 @@ function renderImportResults(rows) {
   body.innerHTML = "";
   for (const row of rows) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${row.room}</td><td>${row.files}</td><td>${row.detail}</td>`;
+    const room = document.createElement("td");
+    room.appendChild(roomLabel(row.room));
+    const files = document.createElement("td");
+    files.textContent = String(row.files);
+    const detail = document.createElement("td");
+    detail.textContent = row.detail;
+    tr.append(room, files, detail);
     body.appendChild(tr);
   }
   table.classList.toggle("hidden", rows.length === 0);
@@ -761,7 +780,7 @@ el("btn-import-scan").addEventListener("click", async () => {
     const summaries = await invoke("sync_now", { kind: openImportKind });
     renderImportResults(
       summaries.map((s) => ({
-        room: roomLabel(s.room),
+        room: s.room,
         files: s.files_synced,
         detail: detalheDaSala(s),
       }))

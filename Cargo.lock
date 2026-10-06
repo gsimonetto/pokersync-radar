@@ -3048,6 +3048,7 @@ dependencies = [
  "scanner",
  "serde",
  "serde_json",
+ "sha2",
  "sync-client",
  "tauri",
  "tauri-build",

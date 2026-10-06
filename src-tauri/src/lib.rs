@@ -100,15 +100,27 @@ impl RadarStatus {
     }
 }
 
+/// O que o Radar guarda (só na memória) entre abrir o navegador pro login
+/// com Google e o deep link voltar. `state` é o nonce que vai e volta pela
+/// URL — protege contra um deep link de origem estranha ser aceito como se
+/// fosse resposta de um login que o agente pediu. `code_verifier` é o
+/// segredo do PKCE (ver `auth::novo_code_verifier`): nunca sai daqui a não
+/// ser no POST da troca do código, então quem só viu o deep link não
+/// consegue trocar o código pela sessão. Os dois andam juntos: um login
+/// novo substitui os dois, e o deep link que chega consome os dois.
+struct LoginGooglePendente {
+    state: String,
+    code_verifier: String,
+}
+
 struct AppState {
     config_path: PathBuf,
     state_dir: PathBuf,
     config: Mutex<AppConfig>,
-    /// Nonce do login com Google em andamento (gerado em
-    /// `start_google_login`, conferido quando o deep link volta) —
-    /// protege contra um deep link de origem estranha ser aceito como se
-    /// fosse resposta de um login que o agente pediu.
-    pending_google_state: Mutex<Option<String>>,
+    /// Login com Google em andamento (gerado em `start_google_login`,
+    /// conferido e consumido quando o deep link volta) — ver
+    /// `LoginGooglePendente`.
+    pending_google_state: Mutex<Option<LoginGooglePendente>>,
     session: tokio::sync::Mutex<Option<Session>>,
     logado: AtomicBool,
     /// Um envio por vez: o ciclo automático e o "Sincronizar agora" nunca
@@ -379,6 +391,49 @@ fn save_device_name(state: State<AppState>, device_name: String) -> Result<(), S
     cfg.save(&state.config_path).map_err(|e| e.to_string())
 }
 
+/// Confere uma pasta extra antes de salvar. A lista vem da tela (JS), então
+/// não dá pra confiar nela: o caminho é resolvido (links e `..`) e precisa
+/// ser uma pasta que existe e não ampla demais — raiz do disco, a pasta
+/// pessoal (ou acima dela) e Documentos/Downloads/Área de trabalho fariam
+/// o Radar varrer e enviar pro site arquivos que não são de poker.
+///
+/// `ja_salvas`: pastas que já estavam na config. Essas não precisam existir
+/// agora (um HD externo desconectado não pode impedir o jogador de remover
+/// outra pasta da lista) e, pra não quebrar quem já usava, só a regra da
+/// raiz/pasta pessoal vale pra elas.
+fn validar_pasta_extra(pasta: &str, ja_salvas: &[String]) -> Result<String, String> {
+    let pasta = pasta.trim();
+    if pasta.is_empty() {
+        return Err("Pasta inválida.".to_string());
+    }
+    let caminho = Path::new(pasta);
+    if !caminho.is_absolute() {
+        return Err(format!("\"{pasta}\" não é um caminho completo de pasta."));
+    }
+    let ampla = || {
+        format!(
+            "\"{pasta}\" é ampla demais (raiz do disco, sua pasta pessoal, Documentos, Downloads ou Área de trabalho) — \
+             escolha a pasta onde ficam só os arquivos de mão/torneio."
+        )
+    };
+    if ja_salvas.iter().any(|p| p == pasta) {
+        if scanner::is_home_or_above(caminho) {
+            return Err(ampla());
+        }
+        return Ok(pasta.to_string());
+    }
+    let resolvida = std::fs::canonicalize(caminho).map_err(|_| format!("A pasta \"{pasta}\" não existe."))?;
+    if !resolvida.is_dir() {
+        return Err(format!("\"{pasta}\" não é uma pasta."));
+    }
+    if scanner::is_too_broad_folder(&resolvida) {
+        return Err(ampla());
+    }
+    // Guarda como o jogador escolheu (é o que aparece na tela); a
+    // validação acima já foi feita no caminho resolvido.
+    Ok(pasta.to_string())
+}
+
 #[tauri::command]
 fn save_extra_folders(
     app: AppHandle,
@@ -386,9 +441,20 @@ fn save_extra_folders(
     kind: String,
     folders: Vec<String>,
 ) -> Result<(), String> {
+    // Só os dois tipos que existem — antes qualquer chave ia parar no
+    // config.json.
+    let kind = parse_kind(&kind)?.slug().to_string();
     {
         let mut cfg = state.config.lock().unwrap();
-        cfg.extra_folders.insert(kind, folders);
+        let ja_salvas = cfg.extra_folders.get(&kind).cloned().unwrap_or_default();
+        let mut validadas: Vec<String> = Vec::new();
+        for pasta in &folders {
+            let pasta = validar_pasta_extra(pasta, &ja_salvas)?;
+            if !validadas.contains(&pasta) {
+                validadas.push(pasta);
+            }
+        }
+        cfg.extra_folders.insert(kind, validadas);
         cfg.save(&state.config_path).map_err(|e| e.to_string())?;
     }
     // Pasta nova já passa a ser vigiada na hora.
@@ -426,14 +492,22 @@ fn start_google_login(app: AppHandle, state: State<AppState>) -> Result<(), Stri
         .take(32)
         .map(char::from)
         .collect();
-    *state.pending_google_state.lock().unwrap() = Some(nonce.clone());
+    let code_verifier = auth::novo_code_verifier();
+    let challenge = auth::code_challenge(&code_verifier);
+    // Substitui (e invalida) qualquer login anterior ainda pendente.
+    *state.pending_google_state.lock().unwrap() = Some(LoginGooglePendente {
+        state: nonce.clone(),
+        code_verifier,
+    });
 
     let device_name = state.config.lock().unwrap().device_name.clone();
     let mut url = url::Url::parse(&format!("{}/agent-login", config::site_url()))
         .expect("DEFAULT_BASE_URL é uma URL fixa e válida");
+    // Só o `challenge` (hash) vai pro navegador; o verifier fica aqui.
     url.query_pairs_mut()
         .append_pair("state", &nonce)
-        .append_pair("device", &device_name);
+        .append_pair("device", &device_name)
+        .append_pair("challenge", &challenge);
 
     app.opener()
         .open_url(url.to_string(), None::<&str>)
@@ -473,23 +547,27 @@ async fn paste_login_link(app: AppHandle, link: String) -> Result<(), String> {
 /// login por senha.
 async fn complete_google_login(app: AppHandle, code: String, received_state: String) {
     let state = app.state::<AppState>();
-    let state_matches = {
+    // Nonce certo: consome o login pendente (state + verifier) na hora —
+    // o mesmo deep link não serve duas vezes.
+    let code_verifier = {
         let mut pending = state.pending_google_state.lock().unwrap();
-        let matches = pending.as_deref() == Some(received_state.as_str()) && !received_state.is_empty();
+        let matches = !received_state.is_empty()
+            && pending.as_ref().is_some_and(|p| p.state == received_state);
         if matches {
-            *pending = None;
+            pending.take().map(|p| p.code_verifier)
+        } else {
+            None
         }
-        matches
     };
-    if !state_matches {
+    let Some(code_verifier) = code_verifier else {
         let _ = app.emit(
             "google-login-result",
             serde_json::json!({ "ok": false, "error": "Login não corresponde ao que o Radar pediu — clique em \"Continuar com Google\" de novo." }),
         );
         return;
-    }
+    };
 
-    match auth::exchange_login_code(config::site_url(), &code).await {
+    match auth::exchange_login_code(config::site_url(), &code, &code_verifier).await {
         Ok(result) => {
             iniciar_sessao(&app, result).await;
             let _ = app.emit("google-login-result", serde_json::json!({ "ok": true }));
@@ -626,18 +704,24 @@ fn state_file_name(room: PokerRoom, kind: FileKind) -> String {
     format!("{}-{}.json", room.slug(), kind.slug())
 }
 
-/// Pastas que o jogador adicionou pra esse tipo de arquivo.
+/// Pastas que o jogador adicionou pra esse tipo de arquivo. Raiz do disco
+/// e pasta pessoal (ou acima) ficam de fora mesmo se já estavam salvas de
+/// uma versão antiga, que não conferia (ver `validar_pasta_extra`) — nem a
+/// varredura nem a vigilância em tempo real descem por elas.
 fn pastas_extras(state: &AppState, kind: FileKind) -> Vec<PathBuf> {
-    state
+    // Copia e solta a trava antes de mexer no disco.
+    let salvas = state
         .config
         .lock()
         .unwrap()
         .extra_folders
         .get(kind.slug())
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    salvas
         .into_iter()
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && !scanner::is_home_or_above(p))
         .collect()
 }
 
@@ -1462,21 +1546,56 @@ struct ResultadoImportacao {
     linhas: Vec<LinhaImportacao>,
 }
 
-/// Lê os arquivos escolhidos, reconhece sala e tipo de cada um e envia —
-/// mesmos lotes, limites e tratamento de recusa do envio automático. Não
-/// entra no progresso das pastas: o site descarta o que já tiver.
+/// Abre a janela de escolher arquivos do SO pelo lado Rust e devolve o que
+/// o jogador escolheu (`None` = cancelou). Antes a tela abria a janela e
+/// mandava a lista de caminhos pro `importar_arquivos` — e o comando lia
+/// qualquer caminho que o JS mandasse. Agora o JS não passa caminho
+/// nenhum: só o que o jogador escolheu de verdade, na janela do SO, é lido.
+async fn escolher_arquivos_para_importar(app: &AppHandle) -> Option<Vec<PathBuf>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialogo = app
+        .dialog()
+        .file()
+        .set_title("Escolher arquivos baixados (.zip ou .txt)")
+        .add_filter("Histórico de mãos", &["zip", "txt"]);
+    if let Some(janela) = app.get_webview_window("main") {
+        dialogo = dialogo.set_parent(&janela);
+    }
+    dialogo.pick_files(move |escolhidos| {
+        let _ = tx.send(escolhidos);
+    });
+    let caminhos: Vec<PathBuf> = rx
+        .await
+        .ok()
+        .flatten()?
+        .into_iter()
+        .filter_map(|p| p.into_path().ok())
+        .collect();
+    (!caminhos.is_empty()).then_some(caminhos)
+}
+
+/// Pede os arquivos ao jogador (janela do SO, ver
+/// `escolher_arquivos_para_importar`), lê, reconhece sala e tipo de cada um
+/// e envia — mesmos lotes, limites e tratamento de recusa do envio
+/// automático. Não entra no progresso das pastas: o site descarta o que já
+/// tiver. `Ok(None)` = o jogador cancelou a escolha.
 #[tauri::command]
-async fn importar_arquivos(app: AppHandle, caminhos: Vec<String>) -> Result<ResultadoImportacao, String> {
+async fn importar_arquivos(app: AppHandle) -> Result<Option<ResultadoImportacao>, String> {
+    let Some(caminhos) = escolher_arquivos_para_importar(&app).await else {
+        return Ok(None);
+    };
+    // A tela mostra "Lendo e enviando N arquivo(s)…" enquanto isto roda.
+    let _ = app.emit("importacao-iniciada", caminhos.len());
     let state = app.state::<AppState>();
     let _um_por_vez = state.sync_lock.lock().await;
     atualizar_status(&app, |s| s.sincronizando = true);
     let resultado = importar_arquivos_interno(&app, caminhos).await;
     atualizar_status(&app, |s| s.sincronizando = false);
-    resultado
+    resultado.map(Some)
 }
 
-async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<String>) -> Result<ResultadoImportacao, String> {
-    let caminhos: Vec<PathBuf> = caminhos.into_iter().map(PathBuf::from).collect();
+async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<PathBuf>) -> Result<ResultadoImportacao, String> {
     let leitura = tauri::async_runtime::spawn_blocking(move || importar::ler_escolhidos(&caminhos))
         .await
         .map_err(|e| e.to_string())??;

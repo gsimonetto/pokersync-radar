@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 /// a memória antiga é jogada fora e todo arquivo é reconhecido de novo
 /// pelas regras novas (ex.: arquivos do ACR que antes eram ignorados).
 /// 2: mão real do ACR ("Game Hand #") e resumo .ots (JSON) — 03/10/2026.
-pub const CLASSIFIER_VERSION: u32 = 2;
+/// 3: cabeçalho da sala exigido no começo da linha, no formato inteiro —
+/// arquivo qualquer que só citava "Game #12" deixa de contar como mão.
+pub const CLASSIFIER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {

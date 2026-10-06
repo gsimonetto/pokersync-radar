@@ -44,6 +44,9 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 rand = "0.8"
 url = "2"
 base64 = "0.22"
+# SHA-256 do PKCE do login com Google (ver `auth::code_challenge`). Mesma
+# versão que já vinha no Cargo.lock por dependência do Tauri.
+sha2 = "0.10"
 # Vigia as pastas de hand history em tempo real (igual ao "auto-import" do
 # PokerTracker/Holdem Manager) — a mão nova vai pro PokerSync segundos
 # depois de jogada, em vez de esperar o ciclo de 5 minutos.

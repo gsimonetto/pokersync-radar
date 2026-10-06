@@ -3,7 +3,7 @@
 O auto-update já está implementado no código (plugin `tauri-plugin-updater`,
 chave pública em `src-tauri/tauri.conf.json`, checagem em `ui/app.js`). Falta
 só um passo manual, único, pra ativar de verdade: cadastrar a chave privada
-de assinatura como secret do repositório.
+de assinatura como secret do Environment `release` (ver o passo a passo).
 
 ## Por quê
 
@@ -29,13 +29,25 @@ tem o Radar instalado não recebe aquela versão sozinho.
 
 ## Passo a passo
 
-1. Vá em **Settings → Secrets and variables → Actions** neste repositório
-   (`gsimonetto/pokersync-radar`).
-2. Clique em **New repository secret** (ou edite, se já existir) e cadastre
-   os dois:
+A chave fica num **Environment** chamado `release` (não nos secrets do
+repositório): o job de release (`.github/workflows/release.yml`) declara
+`environment: release`, então só ele enxerga a chave, e só depois que um
+revisor aprovar a execução.
+
+1. Vá em **Settings → Environments** neste repositório
+   (`gsimonetto/pokersync-radar`) e clique em **New environment** com o nome
+   exato `release`.
+2. Em **Deployment protection rules**, marque **Required reviewers** e
+   adicione você (ou quem pode publicar versões). Em **Deployment branches
+   and tags**, escolha **Selected branches and tags** e libere `main` e o
+   padrão de tag `v*`.
+3. Ainda no Environment `release`, em **Environment secrets → Add
+   environment secret**, cadastre os dois:
    - `TAURI_SIGNING_PRIVATE_KEY` — o conteúdo do arquivo `.key` (uma linha
      longa em base64).
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — a senha da chave.
+4. Apague os dois de **Settings → Secrets and variables → Actions →
+   Repository secrets**, se estiverem lá.
 
 ## Se perder a chave privada ou a senha
 
@@ -54,7 +66,7 @@ jogador precisa baixar e instalar uma vez pelo site.
 
 Suba o número da versão em `src-tauri/tauri.conf.json` e em `Cargo.toml`
 (`workspace.package.version`) e rode **Actions → Release → Run workflow**
-(ou faça push de uma tag `vX.Y.Z`, que já acerta a versão sozinha). O
-workflow builda, assina e publica a release oficial (a "latest"); os Radars
+a partir da `main` (ou faça push de uma tag `vX.Y.Z`, que já acerta a versão
+sozinha), e aprove a execução no Environment `release`. O workflow builda, assina e publica a release oficial (a "latest"); os Radars
 instalados procuram versão nova ao abrir e a cada 6 horas e mostram "Nova
 versão disponível".

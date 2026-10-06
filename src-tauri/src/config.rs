@@ -110,14 +110,22 @@ fn new_device_id() -> String {
     format!("agent-{}", uuid::Uuid::new_v4())
 }
 
+/// Nome padrão deste computador no PokerSync (vai em todo sinal de vida e
+/// envio, e aparece na lista de dispositivos do site). Antes era o nome de
+/// rede do computador, que muitas vezes é o nome da pessoa
+/// ("NOTEBOOK-DO-JOAO-SILVA") — dado pessoal mandado sem necessidade. Agora
+/// é neutro, só com o sistema; quem quiser troca em Configurações. Só vale
+/// pra config nova: quem já tinha um nome salvo (inclusive o antigo) fica
+/// com ele.
 fn default_device_name() -> String {
-    hostname()
-}
-
-fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "PC desconhecido".to_string())
+    let sistema = if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
+    format!("Radar - {sistema}")
 }
 
 impl Default for AppConfig {
@@ -153,5 +161,27 @@ impl AppConfig {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap_or_default())?;
         std::fs::rename(&tmp, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_device_name_has_no_hostname() {
+        let nome = default_device_name();
+        assert!(nome.starts_with("Radar - "), "{nome}");
+        if let Ok(host) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
+            assert!(!nome.contains(&host), "{nome}");
+        }
+    }
+
+    #[test]
+    fn saved_device_name_is_kept() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"device_id":"agent-1","device_name":"PC-DO-JOGADOR"}"#).unwrap();
+        assert_eq!(cfg.device_name, "PC-DO-JOGADOR");
+        let novo: AppConfig = serde_json::from_str(r#"{"device_id":"agent-1"}"#).unwrap();
+        assert_eq!(novo.device_name, default_device_name());
     }
 }

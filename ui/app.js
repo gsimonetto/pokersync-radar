@@ -363,8 +363,6 @@ const SITUACAO = {
   ok: { texto: "Sincronizado", tom: "ok" },
   pendente: { texto: "Enviando", tom: "info" },
   aguardando_site: { texto: "Aguardando o site", tom: "alerta" },
-  pasta_vazia: { texto: "Pasta vazia", tom: "alerta" },
-  nao_encontrada: { texto: "Não encontrada", tom: "neutro" },
 };
 
 let salasCarregando = false;
@@ -401,15 +399,41 @@ function pastaCurta(pasta) {
   return pasta.length > 40 ? "…" + pasta.slice(-38) : pasta;
 }
 
+// Pedido explícito: sala em que o Radar não achou nada no computador (pasta
+// inexistente ou vazia — "nao_encontrada"/"pasta_vazia") não aparece; antes
+// ficavam todas listadas, com "Não encontrada" em quem nem joga lá. Se
+// nenhuma sala tiver nada, um cartão só explica o que fazer.
+function salaTemAlgo(sala) {
+  return sala.maos + sala.torneios > 0;
+}
+
+function renderSalaVazia(grid) {
+  const card = document.createElement("div");
+  card.className = "sala-card sala-vazia";
+  const titulo = document.createElement("div");
+  titulo.className = "sala-vazia-titulo";
+  titulo.textContent = "Ainda não achei mãos de nenhuma sala neste computador";
+  const dica = document.createElement("div");
+  dica.className = "sala-dica";
+  dica.textContent =
+    "Se você joga em alguma sala, ative no cliente a opção de salvar o histórico de mãos, ou adicione a pasta " +
+    "em \"Importar mãos\". No GGPoker, baixe as mãos no PokerCraft e use \"Importar arquivos baixados\".";
+  card.append(titulo, dica);
+  grid.appendChild(card);
+}
+
 function renderSalas(salas) {
   const grid = el("salas-grid");
   grid.innerHTML = "";
-  // Salas com alguma coisa primeiro; as não encontradas no fim, apagadas.
-  const ordem = (s) => (s.situacao === "nao_encontrada" ? 2 : s.situacao === "pasta_vazia" ? 1 : 0);
-  for (const sala of [...salas].sort((a, b) => ordem(a) - ordem(b))) {
-    const situacao = SITUACAO[sala.situacao] ?? SITUACAO.nao_encontrada;
+  const comAlgo = salas.filter(salaTemAlgo);
+  if (comAlgo.length === 0) {
+    renderSalaVazia(grid);
+    return;
+  }
+  for (const sala of comAlgo) {
+    const situacao = SITUACAO[sala.situacao] ?? SITUACAO.ok;
     const card = document.createElement("div");
-    card.className = "sala-card" + (sala.situacao === "nao_encontrada" ? " apagada" : "");
+    card.className = "sala-card";
 
     const topo = document.createElement("div");
     topo.className = "sala-topo";

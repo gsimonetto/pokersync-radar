@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod downloads;
 mod importar;
 mod keychain;
 mod watcher;
@@ -133,7 +134,15 @@ struct AppState {
     /// Vigilância das pastas em tempo real e o canal por onde ela avisa
     /// (ver `spawn_vigia`).
     vigia: Mutex<watcher::Vigia>,
+    /// Vigia da pasta Downloads (só .zip — ver downloads.rs); avisa pelo
+    /// mesmo canal da outra.
+    vigia_downloads: Mutex<watcher::Vigia>,
     aviso_vigia: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Pasta Downloads deste usuário (`None` se o sistema não disser).
+    pasta_downloads: Option<PathBuf>,
+    /// Memória dos .zip da pasta Downloads já olhados (fora do
+    /// `state_dir`, que é apagado quando o jogador amplia o que importar).
+    downloads_vistos_path: PathBuf,
     status: Mutex<RadarStatus>,
     /// Acorda o ciclo automático na hora (depois de um login, por exemplo)
     /// em vez de esperar os 5 minutos.
@@ -200,6 +209,7 @@ struct ConfigDto {
     device_name: String,
     extra_folders: HashMap<String, Vec<String>>,
     auto_sync_enabled: bool,
+    importar_downloads: bool,
     sessao_expirada: bool,
 }
 
@@ -210,6 +220,7 @@ fn config_dto(c: &AppConfig, logged_in: bool) -> ConfigDto {
         device_name: c.device_name.clone(),
         extra_folders: c.extra_folders.clone(),
         auto_sync_enabled: c.auto_sync_enabled,
+        importar_downloads: c.importar_downloads,
         sessao_expirada: c.sessao_expirada,
     }
 }
@@ -502,6 +513,21 @@ fn set_auto_sync_enabled(state: State<AppState>, enabled: bool) -> Result<(), St
     Ok(())
 }
 
+/// Chave "Importar sozinho o que você baixar" (pasta Downloads).
+#[tauri::command]
+fn set_importar_downloads(app: AppHandle, state: State<AppState>, enabled: bool) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.importar_downloads = enabled;
+        cfg.save(&state.config_path).map_err(|e| e.to_string())?;
+    }
+    atualizar_vigia(&app);
+    if enabled {
+        state.wake.notify_one();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn login(app: AppHandle, email: String, password: String) -> Result<ConfigDto, String> {
     let result = auth::login_with_password(email.trim(), &password).await?;
@@ -767,6 +793,15 @@ fn atualizar_vigia(app: &AppHandle) {
     if state.status.lock().unwrap().pastas_vigiadas != vigiadas {
         atualizar_status(app, |s| s.pastas_vigiadas = vigiadas);
     }
+
+    let ligada = state.config.lock().unwrap().importar_downloads;
+    let downloads: Vec<PathBuf> = state
+        .pasta_downloads
+        .iter()
+        .filter(|p| ligada && p.is_dir())
+        .cloned()
+        .collect();
+    state.vigia_downloads.lock().unwrap().atualizar(downloads, &state.aviso_vigia);
 }
 
 /// Recebe os avisos da vigilância e, `watcher::ESPERA_APOS_MUDANCA` depois
@@ -1299,6 +1334,8 @@ fn lembrar_escopo(app: &AppHandle, atual: Option<&str>) {
                 return;
             }
         }
+        // Os .zip da pasta Downloads também vão de novo.
+        let _ = std::fs::remove_file(&state.downloads_vistos_path);
         eprintln!("[radar] escolha ampliada ({anterior:?} -> {atual}): reenviando o histórico");
     }
     cfg.escopo_sincronizado = Some(atual.to_string());
@@ -1336,6 +1373,10 @@ async fn ciclo_interno(app: &AppHandle, enviar: bool) -> Ciclo {
             }
             Err(f) => return registrar_falha(app, f),
         }
+    }
+    match importar_downloads(app).await {
+        Ok(n) => novidades += n,
+        Err(f) => return registrar_falha(app, f),
     }
     let quando = agora();
     atualizar_status(app, |s| {
@@ -1450,14 +1491,19 @@ fn situacao_da_sala(room: PokerRoom, p: &PainelSala) -> &'static str {
 
 /// O que dizer pro jogador sobre a sala — sempre uma ação que ele pode
 /// fazer, nunca só "não achei".
-fn dica_da_sala(room: PokerRoom, p: &PainelSala) -> Option<String> {
+fn dica_da_sala(room: PokerRoom, p: &PainelSala, downloads_ligado: bool) -> Option<String> {
     let nome = room.display_name();
+    // O que fazer com o .zip baixado do PokerCraft.
+    let depois_de_baixar = if downloads_ligado {
+        "o Radar importa sozinho o .zip que chegar na pasta Downloads"
+    } else {
+        "use \"Importar arquivos baixados\""
+    };
     if room == PokerRoom::GgPoker && p.maos == 0 {
-        return Some(
+        return Some(format!(
             "O GGPoker costuma deixar o histórico no PokerCraft, e não no computador: baixe lá suas mãos e \
-             torneios e use \"Importar arquivos baixados\"."
-                .to_string(),
-        );
+             torneios e {depois_de_baixar}."
+        ));
     }
     match p.situacao {
         "nao_encontrada" => Some(format!(
@@ -1474,10 +1520,9 @@ fn dica_da_sala(room: PokerRoom, p: &PainelSala) -> Option<String> {
             "{} arquivo(s) recusado(s) pelo PokerSync — o Radar tenta de novo em um dia.",
             p.recusados
         )),
-        _ if room == PokerRoom::GgPoker && p.torneios == 0 => Some(
-            "Os resultados de torneio do GGPoker ficam no PokerCraft: baixe lá e use \"Importar arquivos baixados\"."
-                .to_string(),
-        ),
+        _ if room == PokerRoom::GgPoker && p.torneios == 0 => Some(format!(
+            "Os resultados de torneio do GGPoker ficam no PokerCraft: baixe lá e {depois_de_baixar}."
+        )),
         _ if room == PokerRoom::PokerStars && p.torneios == 0 => Some(
             "Joga torneios? No cliente do PokerStars, ative também a opção de salvar os resumos de torneio — \
              é de lá que vem a premiação."
@@ -1530,6 +1575,7 @@ fn montar_painel(state: &AppState) -> Vec<PainelSala> {
         }
     }
 
+    let downloads_ligado = state.config.lock().unwrap().importar_downloads;
     painel
         .into_iter()
         .map(|(room, mut p, mut pastas)| {
@@ -1537,7 +1583,7 @@ fn montar_painel(state: &AppState) -> Vec<PainelSala> {
             pastas.dedup();
             p.pastas = pastas.into_iter().map(|c| c.display().to_string()).collect();
             p.situacao = situacao_da_sala(room, &p);
-            p.dica = dica_da_sala(room, &p);
+            p.dica = dica_da_sala(room, &p, downloads_ligado);
             p
         })
         .collect()
@@ -1630,6 +1676,31 @@ async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<PathBuf>) -> R
     let leitura = tauri::async_runtime::spawn_blocking(move || importar::ler_escolhidos(&caminhos))
         .await
         .map_err(|e| e.to_string())??;
+    let resultado = match enviar_leitura(app, leitura).await {
+        Ok(r) => r,
+        Err(f) => {
+            let mensagem = f.mensagem();
+            if matches!(f, Falha::Site(_)) {
+                registrar_falha(app, f);
+            }
+            return Err(mensagem);
+        }
+    };
+    let novidades: u32 = resultado.linhas.iter().map(|l| l.imported).sum();
+    if novidades > 0 {
+        let quando = agora();
+        atualizar_status(app, |s| {
+            s.ultimas_novidades = Some(novidades);
+            s.ultimas_novidades_em = Some(quando);
+        });
+    }
+    Ok(resultado)
+}
+
+/// Envia o que foi lido de arquivos baixados (escolhidos pelo jogador ou
+/// achados na pasta Downloads) — mesmos lotes, limites e tratamento de
+/// recusa do envio automático.
+async fn enviar_leitura(app: &AppHandle, leitura: importar::Leitura) -> Result<ResultadoImportacao, Falha> {
     let device = device_info(&app.state::<AppState>());
     let mut linhas = Vec::new();
 
@@ -1650,10 +1721,7 @@ async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<PathBuf>) -> R
             linhas.push(linha);
             continue;
         }
-        let chave = match chave_de_acesso(app, None).await {
-            Ok(c) => c,
-            Err(e) => return Err(e.mensagem()),
-        };
+        let chave = chave_de_acesso(app, None).await.map_err(Falha::Auth)?;
         let mut envio = Envio {
             app,
             device: &device,
@@ -1708,11 +1776,7 @@ async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<PathBuf>) -> R
             Ok::<(), Falha>(())
         }
         .await;
-        if let Err(f) = enviado {
-            let mensagem = f.mensagem();
-            registrar_falha(app, f);
-            return Err(mensagem);
-        }
+        enviado?;
         linha.imported = resumo.imported;
         linha.duplicates = resumo.duplicates;
         linha.errors = resumo.errors;
@@ -1721,19 +1785,84 @@ async fn importar_arquivos_interno(app: &AppHandle, caminhos: Vec<PathBuf>) -> R
         linhas.push(linha);
     }
 
-    let novidades: u32 = linhas.iter().map(|l| l.imported).sum();
-    if novidades > 0 {
-        let quando = agora();
-        atualizar_status(app, |s| {
-            s.ultimas_novidades = Some(novidades);
-            s.ultimas_novidades_em = Some(quando);
-        });
-    }
     Ok(ResultadoImportacao {
         arquivos_lidos: leitura.arquivos_lidos,
         ignorados: leitura.ignorados,
         linhas,
     })
+}
+
+/// Envia sozinho os .zip de mãos/torneios baixados nos últimos 7 dias (o
+/// do PokerCraft, no GGPoker) que ainda não tinham sido olhados — ver
+/// downloads.rs. Roda dentro do ciclo, com o envio travado. Devolve
+/// quantos itens novos entraram. Um .zip só fica marcado como visto depois
+/// de enviado (ou de o Radar ver que não é de poker): se o envio falhar,
+/// vai de novo no próximo ciclo.
+async fn importar_downloads(app: &AppHandle) -> Result<u32, Falha> {
+    let state = app.state::<AppState>();
+    if !state.config.lock().unwrap().importar_downloads {
+        return Ok(0);
+    }
+    let Some(pasta) = state.pasta_downloads.clone() else {
+        return Ok(0);
+    };
+    let memoria = state.downloads_vistos_path.clone();
+
+    // Acha os .zip novos e separa os que têm mão/torneio, fora da thread
+    // da tela (abre arquivos). O que não é de poker já fica marcado.
+    let olhada = tauri::async_runtime::spawn_blocking(move || {
+        let mut vistos = downloads::Vistos::load(&memoria);
+        vistos.limpar(now_unix());
+        let mut de_poker = Vec::new();
+        for (caminho, sig) in downloads::candidatos(&pasta, &vistos, now_unix()) {
+            if importar::tem_arquivo_de_poker(&caminho) {
+                de_poker.push((caminho, sig));
+            } else {
+                vistos.marcar(caminho, sig);
+            }
+        }
+        if let Err(e) = vistos.save(&memoria) {
+            eprintln!("[radar] não consegui gravar os downloads já vistos: {e}");
+        }
+        (vistos, de_poker)
+    })
+    .await;
+    let Ok((mut vistos, de_poker)) = olhada else {
+        return Ok(0);
+    };
+
+    let mut novidades = 0u32;
+    for (caminho, sig) in de_poker {
+        let c = caminho.clone();
+        let leitura = tauri::async_runtime::spawn_blocking(move || importar::ler_escolhidos(&[c])).await;
+        match leitura {
+            Ok(Ok(leitura)) => {
+                let resultado = enviar_leitura(app, leitura).await?;
+                let soma = |tipo: FileKind| -> u32 {
+                    resultado
+                        .linhas
+                        .iter()
+                        .filter(|l| l.tipo == tipo.slug())
+                        .map(|l| l.imported)
+                        .sum()
+                };
+                let (maos, torneios) = (soma(FileKind::HandHistory), soma(FileKind::TournamentSummary));
+                novidades += maos + torneios;
+                if let Some(aviso) = downloads::aviso_de_importacao(maos, torneios) {
+                    let _ = app.notification().builder().title("Radar PokerSync").body(aviso).show();
+                }
+            }
+            // .zip estragado ou grande demais: fica de lado (dá pra tentar
+            // em "Importar arquivos baixados", que mostra o erro).
+            Ok(Err(e)) => eprintln!("[radar] não consegui ler {} da pasta Downloads: {e}", caminho.display()),
+            Err(_) => continue,
+        }
+        vistos.marcar(caminho, sig);
+        if let Err(e) = vistos.save(&state.downloads_vistos_path) {
+            eprintln!("[radar] não consegui gravar os downloads já vistos: {e}");
+        }
+    }
+    Ok(novidades)
 }
 
 /// O jogador escolheu, no próprio Radar, o que importar — salva no site
@@ -1882,10 +2011,24 @@ pub fn run() {
                 let _ = config.save(&config_path);
             }
 
+            // O "iniciar com o computador" guarda o caminho do .exe de
+            // quando foi ligado. Na 0.3.2 o programa passou de
+            // pokersync-agent.exe pra radar.exe, e a atualização apaga o
+            // antigo: sem regravar o caminho, o Radar parava de abrir com o
+            // computador. Só regrava se estiver ligado (quem desligou,
+            // inclusive pelo Gerenciador de Tarefas, continua desligado).
+            if app.autolaunch().is_enabled().unwrap_or(false) {
+                if let Err(e) = app.autolaunch().enable() {
+                    eprintln!("[radar] não consegui atualizar o \"abrir com o computador\": {e}");
+                }
+            }
+
             let status = RadarStatus::inicial(logado, config.sessao_expirada);
             let dica = texto_bandeja(&status);
             let (aviso_vigia, avisos) = tokio::sync::mpsc::unbounded_channel();
+            let pasta_downloads = app.path().download_dir().ok();
             app.manage(AppState {
+                downloads_vistos_path: config_dir.join("downloads-vistos.json"),
                 config_path,
                 state_dir,
                 config: Mutex::new(config),
@@ -1897,8 +2040,10 @@ pub fn run() {
                 logado: AtomicBool::new(logado),
                 sync_lock: tokio::sync::Mutex::new(()),
                 discover_lock: Mutex::new(()),
-                vigia: Mutex::new(watcher::Vigia::default()),
+                vigia: Mutex::new(watcher::Vigia::de_maos()),
+                vigia_downloads: Mutex::new(watcher::Vigia::de_downloads()),
                 aviso_vigia,
+                pasta_downloads,
                 status: Mutex::new(status),
                 wake: tokio::sync::Notify::new(),
             });
@@ -1993,6 +2138,7 @@ pub fn run() {
             save_device_name,
             save_extra_folders,
             set_auto_sync_enabled,
+            set_importar_downloads,
             login,
             start_google_login,
             paste_login_link,
@@ -2128,7 +2274,7 @@ mod tests {
 
     fn com_situacao(room: PokerRoom, mut p: PainelSala) -> PainelSala {
         p.situacao = situacao_da_sala(room, &p);
-        p.dica = dica_da_sala(room, &p);
+        p.dica = dica_da_sala(room, &p, true);
         p
     }
 
@@ -2151,7 +2297,19 @@ mod tests {
         assert_eq!(sumida.situacao, "nao_encontrada");
 
         let gg = com_situacao(PokerRoom::GgPoker, painel(0, 0, 0, 0));
-        assert!(gg.dica.unwrap().contains("PokerCraft"));
+        let dica = gg.dica.unwrap();
+        assert!(dica.contains("PokerCraft") && dica.contains("pasta Downloads"), "{dica}");
+
+        // Com a importação da pasta Downloads desligada, manda importar na mão.
+        let gg_maos = painel(100, 0, 1, 0);
+        let gg_maos = PainelSala {
+            situacao: situacao_da_sala(PokerRoom::GgPoker, &gg_maos),
+            ..gg_maos
+        };
+        let ligada = dica_da_sala(PokerRoom::GgPoker, &gg_maos, true).unwrap();
+        assert!(ligada.contains("importa sozinho"), "{ligada}");
+        let desligada = dica_da_sala(PokerRoom::GgPoker, &gg_maos, false).unwrap();
+        assert!(desligada.contains("Importar arquivos baixados"), "{desligada}");
 
         // O ACR não espera mais o site: com mão pendente, é envio normal.
         let acr = com_situacao(PokerRoom::Acr, painel(40, 0, 1, 40));

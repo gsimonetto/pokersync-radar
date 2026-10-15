@@ -128,6 +128,19 @@ Radar achou no computador), plano sem Radar ou sessão vencida.
   reconhecido pelo conteúdo (`PokerRoom::classify`) e enviado com os mesmos
   lotes e tratamento de recusa do envio automático; não entra no progresso
   das pastas (o site descarta o que já tiver).
+- **Importar sozinho o que baixar do PokerCraft** (`src-tauri/src/downloads.rs`,
+  `importar_downloads` no `lib.rs`, chave `importar_downloads` na config,
+  ligada por padrão): o Radar vigia a pasta Downloads (só os `.zip` direto
+  nela, `Vigia::de_downloads` em `watcher.rs`) e, a cada ciclo, envia os
+  `.zip` dos últimos 7 dias que ainda não olhou. O nome do arquivo não
+  importa (o PokerCraft baixa com um código no lugar do nome): antes de ler
+  o `.zip` inteiro, o Radar espia o começo de até 20 arquivos de texto dentro
+  dele (`importar::tem_arquivo_de_poker`) — `.zip` sem mão nem torneio fica
+  de lado sem ser enviado. Os já olhados ficam em `downloads-vistos.json`
+  (tamanho + data; se o arquivo mudar, é olhado de novo). Arquivo mexido há
+  menos de 5 s (download ainda em andamento) fica pro próximo aviso. Só roda
+  com a sincronização automática ligada (ou no "Sincronizar agora"); quando
+  entra algo novo, aparece uma notificação do sistema.
 - O "resumo parcial" de torneio sem arquivo de resumo (buy-in, campeão,
   2º/3º lugar, mesa final) o site já monta a partir das mãos
   (`applyTournamentSignals` em `lib/services/agent-sync-service.ts`).

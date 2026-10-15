@@ -81,6 +81,14 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub auto_sync_enabled: bool,
 
+    /// Importa sozinho os .zip de mãos/torneios que o jogador baixa (o do
+    /// PokerCraft, no GGPoker), olhando a pasta Downloads (ver
+    /// downloads.rs). Padrão: ligado (pedido explícito), com chave pra
+    /// desligar em Configurações. Só vale com a sincronização automática
+    /// ligada (ou no "Sincronizar agora").
+    #[serde(default = "default_true")]
+    pub importar_downloads: bool,
+
     /// "Iniciar com o computador" já foi decidido: o Radar liga sozinho uma
     /// vez, no primeiro login (pedido explícito: "quero o radar logando
     /// automático quando liga o pc") — depois disso vale só a escolha do
@@ -136,6 +144,7 @@ impl Default for AppConfig {
             device_name: default_device_name(),
             extra_folders: HashMap::new(),
             auto_sync_enabled: true,
+            importar_downloads: true,
             autostart_configurado: false,
             sessao_expirada: false,
             escopo_sincronizado: None,
@@ -183,5 +192,15 @@ mod tests {
         assert_eq!(cfg.device_name, "PC-DO-JOGADOR");
         let novo: AppConfig = serde_json::from_str(r#"{"device_id":"agent-1"}"#).unwrap();
         assert_eq!(novo.device_name, default_device_name());
+    }
+
+    #[test]
+    fn downloads_import_starts_on_for_old_configs() {
+        // config.json de uma versão antiga, sem a chave nova: vem ligada.
+        let antigo: AppConfig = serde_json::from_str(r#"{"device_id":"agent-1"}"#).unwrap();
+        assert!(antigo.importar_downloads);
+        let desligou: AppConfig =
+            serde_json::from_str(r#"{"device_id":"agent-1","importar_downloads":false}"#).unwrap();
+        assert!(!desligou.importar_downloads);
     }
 }

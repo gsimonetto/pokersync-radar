@@ -1,5 +1,10 @@
 [package]
-name = "pokersync-agent"
+# Vira o nome do programa no computador do jogador: radar.exe (antes
+# pokersync-agent.exe; pedido explícito, sem "poker" no nome do .exe). Na
+# atualização, o instalador apaga o .exe antigo e corrige os atalhos
+# sozinho; o "iniciar com o computador" é corrigido ao abrir (ver `run`
+# em src/lib.rs).
+name = "radar"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

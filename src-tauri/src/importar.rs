@@ -5,7 +5,7 @@
 //! qualquer sala. A sala e o tipo de cada arquivo saem do conteúdo, igual
 //! à varredura das pastas (`PokerRoom::classify`).
 
-use scanner::text::{decode_text, fingerprint};
+use scanner::text::{decode_prefix, decode_text, fingerprint};
 use scanner::{has_text_extension, FileKind, PokerRoom};
 use std::collections::HashSet;
 use std::io::Read;
@@ -18,6 +18,11 @@ const MAX_ARQUIVO_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// Quanto do começo do texto olhar pra reconhecer a sala.
 const CABECALHO_CHARS: usize = 4096;
+/// O mesmo começo, em bytes (até 4 bytes por caractere).
+const CABECALHO_BYTES: u64 = (CABECALHO_CHARS * 4) as u64;
+/// Quantos arquivos de texto, no máximo, espiar dentro de um .zip pra
+/// decidir se ele é de mãos/torneios (ver `tem_arquivo_de_poker`).
+const MAX_ESPIADOS: usize = 20;
 
 /// Arquivos de uma mesma sala e tipo, prontos pra enviar.
 #[derive(Debug)]
@@ -64,10 +69,38 @@ pub fn reconhecer(texto: &str) -> Option<(FileKind, PokerRoom)> {
         .find_map(|kind| PokerRoom::classify(kind, head, None).map(|room| (kind, room)))
 }
 
-fn e_zip(path: &Path) -> bool {
+pub fn e_zip(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
+/// Se o .zip tem algum arquivo de mão ou de resumo de torneio, olhando só
+/// o começo de no máximo `MAX_ESPIADOS` arquivos de texto. Usado na
+/// importação sozinha da pasta Downloads (ver downloads.rs): um .zip que
+/// não é de poker não é lido por inteiro nem enviado.
+pub fn tem_arquivo_de_poker(caminho: &Path) -> bool {
+    let Ok(arquivo) = std::fs::File::open(caminho) else { return false };
+    let Ok(mut zip) = zip::ZipArchive::new(arquivo) else { return false };
+    let mut espiados = 0;
+    for i in 0..zip.len() {
+        if espiados >= MAX_ESPIADOS {
+            break;
+        }
+        let Ok(mut entrada) = zip.by_index(i) else { continue };
+        if !entrada.is_file() || !has_text_extension(Path::new(entrada.name())) {
+            continue;
+        }
+        espiados += 1;
+        let mut bytes = Vec::new();
+        if (&mut entrada).take(CABECALHO_BYTES).read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        if reconhecer(&decode_prefix(&bytes)).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Lê os arquivos escolhidos (.zip e .txt/.log), reconhece cada um e
@@ -227,6 +260,31 @@ mod tests {
         assert!(leitura.grupos.is_empty());
         let erro = ler_escolhidos(&[dir.path().join("nao-existe.txt")]).unwrap_err();
         assert!(erro.contains("nao-existe.txt"), "{erro}");
+    }
+
+    #[test]
+    fn peeks_zip_for_poker_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let pokercraft = zip_com(
+            dir.path(),
+            "pokercraft.zip",
+            &[("leia-me.txt", "nada a ver"), ("summaries/GG - Tournament #9001.txt", GG_RESUMO)],
+        );
+        assert!(tem_arquivo_de_poker(&pokercraft));
+
+        let fotos = zip_com(dir.path(), "fotos.zip", &[("lista.txt", "praia, 2026"), ("foto.jpg", "bytes")]);
+        assert!(!tem_arquivo_de_poker(&fotos));
+
+        // Só espia os primeiros MAX_ESPIADOS arquivos de texto.
+        let outros: Vec<(String, &str)> = (0..MAX_ESPIADOS).map(|i| (format!("nota{i}.txt"), "nada")).collect();
+        let mut arquivos: Vec<(&str, &str)> = outros.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+        arquivos.push(("GG - Tournament #9001.txt", GG_RESUMO));
+        let fundo = zip_com(dir.path(), "fundo.zip", &arquivos);
+        assert!(!tem_arquivo_de_poker(&fundo));
+
+        let falso = dir.path().join("baixando.zip");
+        std::fs::write(&falso, "ainda baixando").unwrap();
+        assert!(!tem_arquivo_de_poker(&falso));
     }
 
     #[test]

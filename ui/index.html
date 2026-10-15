@@ -246,7 +246,8 @@
         <p class="settings-row-hint">
           No GGPoker, baixe as mãos e os resultados de torneio no PokerCraft e escolha o .zip aqui. Serve
           também pra arquivos .txt de qualquer sala — o Radar reconhece sozinho de onde é cada um, e o que já
-          estiver no PokerSync não entra de novo.
+          estiver no PokerSync não entra de novo. Com "Importar sozinho o que você baixar do PokerCraft" ligado
+          (em Configurações), o .zip que chega na pasta Downloads já vai sozinho.
         </p>
         <div id="arquivos-status" class="status-msg"></div>
         <table id="arquivos-tabela" class="results-table hidden">
@@ -297,6 +298,18 @@
             <div class="settings-row-hint">Verifica e envia mãos/torneios novos sozinho, a cada poucos minutos — sem precisar clicar em nada.</div>
           </div>
           <label class="switch"><input type="checkbox" id="auto-sync-toggle" /><span class="slider"></span></label>
+        </div>
+
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">Importar sozinho o que você baixar do PokerCraft</div>
+            <div class="settings-row-hint">
+              O Radar olha a pasta Downloads: quando chega um .zip de mãos ou torneios (como o do PokerCraft, no
+              GGPoker), ele envia sozinho. Só olha arquivos .zip dos últimos 7 dias e só envia o que for de poker —
+              o resto fica só no seu computador.
+            </div>
+          </div>
+          <label class="switch"><input type="checkbox" id="downloads-toggle" /><span class="slider"></span></label>
         </div>
 
         <div class="settings-row">

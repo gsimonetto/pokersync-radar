@@ -3037,37 +3037,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pokersync-agent"
-version = "0.3.1"
-dependencies = [
- "base64 0.22.1",
- "keyring",
- "notify",
- "rand 0.8.8",
- "reqwest 0.12.28",
- "scanner",
- "serde",
- "serde_json",
- "sha2",
- "sync-client",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-deep-link",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-single-instance",
- "tauri-plugin-updater",
- "tempfile",
- "tokio",
- "url",
- "uuid",
- "zip 2.4.2",
-]
-
-[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3273,6 +3242,37 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "radar"
+version = "0.3.2"
+dependencies = [
+ "base64 0.22.1",
+ "keyring",
+ "notify",
+ "rand 0.8.8",
+ "reqwest 0.12.28",
+ "scanner",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sync-client",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-deep-link",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-updater",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+ "zip 2.4.2",
+]
 
 [[package]]
 name = "rand"
@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "scanner"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -4218,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "sync-client"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

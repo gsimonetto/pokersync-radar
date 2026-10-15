@@ -84,6 +84,7 @@ async function refreshConfig() {
   const cfg = await invoke("get_config");
   el("device-name-input").value = cfg.device_name ?? "";
   el("auto-sync-toggle").checked = cfg.auto_sync_enabled;
+  el("downloads-toggle").checked = cfg.importar_downloads;
   extraFolders = cfg.extra_folders ?? {};
   showScreen(cfg.logged_in);
   el("login-aviso").classList.toggle("hidden", cfg.logged_in || !cfg.sessao_expirada);
@@ -417,7 +418,8 @@ function renderSalaVazia(grid) {
   dica.className = "sala-dica";
   dica.textContent =
     "Se você joga em alguma sala, ative no cliente a opção de salvar o histórico de mãos, ou adicione a pasta " +
-    "em \"Importar mãos\". No GGPoker, baixe as mãos no PokerCraft e use \"Importar arquivos baixados\".";
+    "em \"Importar mãos\". No GGPoker, baixe as mãos no PokerCraft: o Radar importa sozinho o .zip que chegar " +
+    "na pasta Downloads (ou use \"Importar arquivos baixados\").";
   card.append(titulo, dica);
   grid.appendChild(card);
 }
@@ -623,6 +625,19 @@ el("auto-sync-toggle").addEventListener("change", async (e) => {
   try {
     await invoke("set_auto_sync_enabled", { enabled });
     if (ultimoStatus) renderStatus(ultimoStatus);
+  } catch (err) {
+    e.target.checked = !enabled;
+    setStatus(el("config-status"), String(err), "err");
+  }
+});
+
+// Importar sozinho os .zip que chegam na pasta Downloads (o do PokerCraft).
+// A dica do GGPoker em "Suas salas" muda junto.
+el("downloads-toggle").addEventListener("change", async (e) => {
+  const enabled = e.target.checked;
+  try {
+    await invoke("set_importar_downloads", { enabled });
+    carregarSalas();
   } catch (err) {
     e.target.checked = !enabled;
     setStatus(el("config-status"), String(err), "err");
